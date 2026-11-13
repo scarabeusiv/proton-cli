@@ -140,6 +140,10 @@ func cmdEvents(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("derive salted key password: %w", err)
 		}
+		// SaltForKey returns only the last 31 bytes of the 60-byte bcrypt
+		// output; the first 29 bytes stay in a slice inside the library
+		// that this code never sees, so only the returned subslice can
+		// be zeroed here.
 		defer zero(salted)
 
 		// Use the member's address keyring to unlock the calendar passphrase.
@@ -195,6 +199,8 @@ func cmdEvents(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("unlock calendar keys: %w", err)
 		}
+		// The passphrase is only needed to unlock the keys.
+		zero(rawPass)
 	}
 
 	events, err := listCalendarEvents(ctx, c, *calendarID, filter)
