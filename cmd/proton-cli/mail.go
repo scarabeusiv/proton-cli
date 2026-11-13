@@ -11,6 +11,7 @@ import (
 
 	"github.com/ProtonMail/gluon/rfc822"
 	proton "github.com/ProtonMail/go-proton-api"
+	"github.com/ProtonMail/gopenpgp/v2/crypto"
 	gomail "net/mail"
 )
 
@@ -149,6 +150,7 @@ func cmdMailList(ctx context.Context, args []string) error {
 func cmdMailRead(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mail read", flag.ContinueOnError)
 	decrypt := fs.Bool("decrypt", false, "decrypt the body (reads account password from stdin)")
+	noDaemon := fs.Bool("no-daemon", false, "do not use the daemon; always prompt for the account password")
 	downloadAtt := fs.Bool("download-attachments", false, "download attachments (decrypted) into a directory; requires --decrypt")
 	attDir := fs.String("attachments-dir", "", "directory for downloaded attachments (default: <message-id>-attachments)")
 	if err := fs.Parse(args); err != nil {
@@ -188,55 +190,84 @@ func cmdMailRead(ctx context.Context, args []string) error {
 	out["attachments"] = atts
 
 	if *decrypt {
-		pw, err := readSecretLine("Enter account password (via stdin):")
-		if err != nil {
-			return err
-		}
-		defer zero(pw)
-
-		// The key password is the SALTED password, not the raw account
-		// password: derive it from the salts captured at login.
-		stored, err := loadSession()
-		if err != nil {
-			return err
-		}
-		if len(stored.Salts) == 0 {
-			return fmt.Errorf("no key salts stored in session — run `proton-cli login` again to capture them")
-		}
-		user, err := c.GetUser(ctx)
-		if err != nil {
-			return fmt.Errorf("get user: %w", err)
-		}
-		primaryID := primaryKeyID(user.Keys)
-		if primaryID == "" {
-			return fmt.Errorf("no primary user key — cannot derive salted key password")
-		}
-		salted, err := stored.Salts.SaltForKey(pw, primaryID)
-		if err != nil {
-			return fmt.Errorf("derive salted key password: %w", err)
-		}
-		if len(salted) == 0 {
-			return fmt.Errorf("derive salted key password: empty salted password")
-		}
-		defer zero(salted)
-
-		kr, err := unlockAddressKeyring(ctx, c, salted, msg.AddressID)
-		if err != nil {
-			return err
+		// The daemon holds the unlocked keyring in memory; when it
+		// answers, decrypt through it and never prompt. Otherwise
+		// fall back to the local prompt path, exactly as before.
+		useDaemon := false
+		if !*noDaemon {
+			useDaemon, _ = pingDaemon()
 		}
 
-		body, err := msg.Decrypt(kr)
-		if err != nil {
-			return fmt.Errorf("decrypt body: %w", err)
+		var kr *crypto.KeyRing
+		if !useDaemon {
+			pw, err := readSecretLine("Enter account password (via stdin):")
+			if err != nil {
+				return err
+			}
+			defer zero(pw)
+
+			// The key password is the SALTED password, not the raw account
+			// password: derive it from the salts captured at login.
+			stored, err := loadSession()
+			if err != nil {
+				return err
+			}
+			if len(stored.Salts) == 0 {
+				return fmt.Errorf("no key salts stored in session — run `proton-cli login` again to capture them")
+			}
+			user, err := c.GetUser(ctx)
+			if err != nil {
+				return fmt.Errorf("get user: %w", err)
+			}
+			primaryID := primaryKeyID(user.Keys)
+			if primaryID == "" {
+				return fmt.Errorf("no primary user key — cannot derive salted key password")
+			}
+			salted, err := stored.Salts.SaltForKey(pw, primaryID)
+			if err != nil {
+				return fmt.Errorf("derive salted key password: %w", err)
+			}
+			if len(salted) == 0 {
+				return fmt.Errorf("derive salted key password: empty salted password")
+			}
+			defer zero(salted)
+
+			kr, err = unlockAddressKeyring(ctx, c, salted, msg.AddressID)
+			if err != nil {
+				return err
+			}
 		}
-		out["body"] = string(body)
+
+		if useDaemon {
+			body, err := daemonDecryptMailBody(msg.Body)
+			if err != nil {
+				return fmt.Errorf("decrypt body: %w", err)
+			}
+			out["body"] = string(body)
+		} else {
+			body, err := msg.Decrypt(kr)
+			if err != nil {
+				return fmt.Errorf("decrypt body: %w", err)
+			}
+			out["body"] = string(body)
+		}
 
 		if *downloadAtt {
 			dir := *attDir
 			if dir == "" {
 				dir = id + "-attachments"
 			}
-			if err := downloadAttachments(ctx, c, kr, msg, dir, atts); err != nil {
+			var decrypt attachmentDecrypter
+			if useDaemon {
+				decrypt = func(att proton.Attachment, data []byte) ([]byte, error) {
+					return daemonDecryptAttachment(att.KeyPackets, data)
+				}
+			} else {
+				decrypt = func(att proton.Attachment, data []byte) ([]byte, error) {
+					return decryptAttachment(kr, att, data)
+				}
+			}
+			if err := downloadAttachments(ctx, c, decrypt, msg, dir, atts); err != nil {
 				return err
 			}
 		}

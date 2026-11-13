@@ -51,6 +51,8 @@ func main() {
 		err = cmdKeys(ctx, os.Args[2:])
 	case "contacts":
 		err = cmdContacts(ctx, os.Args[2:])
+	case "daemon":
+		err = cmdDaemon(ctx, os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -82,6 +84,7 @@ Commands:
   event-raw  Diagnostic: print one event's part structure (no decrypt, no password)
   keys       Diagnostic: list key IDs/flags and stored key-salt IDs (no secrets)
   contacts   List/search contacts
+  daemon     Hold the unlocked keyring in memory: start | stop | status | ics
 
 Secrets are only read from stdin, never from argv or the environment.
 Run 'proton-cli <command> -h' for command flags.

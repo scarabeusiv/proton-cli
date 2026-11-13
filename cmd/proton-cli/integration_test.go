@@ -19,6 +19,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -34,6 +35,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/ProtonMail/gopenpgp/v2/crypto"
 )
 
 // ---------------------------------------------------------------------------
@@ -167,6 +171,70 @@ func TestCLIMailReadMissingID(t *testing.T) {
 	}
 }
 
+func TestCLIDaemonNoSubcommand(t *testing.T) {
+	_, stderr, code := runCLI(t, "daemon")
+	if code == 0 {
+		t.Fatal("daemon with no subcommand: expected non-zero exit, got 0")
+	}
+	if !strings.Contains(stderr, "usage: proton-cli daemon") {
+		t.Errorf("daemon with no subcommand: stderr = %q, want the daemon usage", stderr)
+	}
+}
+
+func TestCLIDaemonUnknownSubcommand(t *testing.T) {
+	_, stderr, code := runCLI(t, "daemon", "bogus")
+	if code == 0 {
+		t.Fatal("daemon bogus: expected non-zero exit, got 0")
+	}
+	if !strings.Contains(stderr, "unknown daemon subcommand") {
+		t.Errorf("daemon bogus: stderr = %q, want unknown daemon subcommand", stderr)
+	}
+}
+
+func TestCLIDaemonStatusNotRunning(t *testing.T) {
+	out, _, code := runCLI(t, "daemon", "status")
+	if code != 0 {
+		t.Fatalf("daemon status: exit code %d, want 0", code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("daemon status output is not JSON: %v (%q)", err, out)
+	}
+	if got["running"] != false {
+		t.Errorf("daemon status = %v, want running=false", got)
+	}
+}
+
+func TestCLIDaemonStopNotRunning(t *testing.T) {
+	_, stderr, code := runCLI(t, "daemon", "stop")
+	if code == 0 {
+		t.Fatal("daemon stop with no daemon: expected non-zero exit, got 0")
+	}
+	if !strings.Contains(stderr, "daemon is not running") {
+		t.Errorf("daemon stop: stderr = %q, want daemon is not running", stderr)
+	}
+}
+
+func TestCLIDaemonICSNotRunning(t *testing.T) {
+	_, stderr, code := runCLI(t, "daemon", "ics")
+	if code == 0 {
+		t.Fatal("daemon ics with no daemon: expected non-zero exit, got 0")
+	}
+	if !strings.Contains(stderr, "daemon is not running") {
+		t.Errorf("daemon ics: stderr = %q, want daemon is not running", stderr)
+	}
+}
+
+func TestCLIDaemonStartBadPort(t *testing.T) {
+	_, stderr, code := runCLI(t, "daemon", "start", "--ics-port", "0")
+	if code == 0 {
+		t.Fatal("daemon start --ics-port 0: expected non-zero exit, got 0")
+	}
+	if !strings.Contains(stderr, "--ics-port must be 1-65535") {
+		t.Errorf("daemon start --ics-port 0: stderr = %q, want the port range error", stderr)
+	}
+}
+
 func TestCLIStatusNoSession(t *testing.T) {
 	stdout, _, code := runCLI(t, "status")
 	if code != 0 {
@@ -203,6 +271,8 @@ type mockAPI struct {
 
 	// refreshErr makes POST /auth/v4/refresh fail.
 	refreshErr bool
+	// calendarsErr makes GET /calendar/v1 fail.
+	calendarsErr bool
 	// eventsFullPages makes the events endpoint return a full page
 	// (100 events) on every page, so listCalendarEvents hits its cap.
 	eventsFullPages bool
@@ -231,6 +301,11 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprint(w, `{"Code":1000,"Auth":{"UID":"test-uid","AccessToken":"test-access","RefreshToken":"test-refresh-new"}}`)
 	case r.Method == http.MethodGet && r.URL.Path == "/calendar/v1":
+		if m.calendarsErr {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"Code":2000,"Error":"calendar list failed"}`)
+			return
+		}
 		writeJSON(w, map[string]any{"Code": 1000, "Calendars": m.calendars})
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/calendar/v1/") && strings.HasSuffix(r.URL.Path, "/events"):
 		m.mu.Lock()
@@ -576,5 +651,199 @@ func TestIntegrationRefreshFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "session refresh failed") {
 		t.Errorf("cmdCalendars error = %v, want it to mention session refresh", err)
+	}
+}
+
+// testEncryptedMockEvent builds a mock calendar event whose SharedEvents
+// part is an armored PGP message (encrypted to kr) carrying the given
+// iCal payload. The part is encrypted, not signed, so only the calendar
+// keyring is needed to decrypt it.
+func testEncryptedMockEvent(t *testing.T, kr *crypto.KeyRing, id string, start, end int64, fullDay bool, ical string) map[string]any {
+	t.Helper()
+	armored := testEncryptArmor(t, kr, ical)
+	fd := 0
+	if fullDay {
+		fd = 1
+	}
+	return map[string]any{
+		"ID":              id,
+		"CalendarID":      "cal1",
+		"StartTime":       start,
+		"EndTime":         end,
+		"FullDay":         fd,
+		"SharedKeyPacket": "",
+		"SharedEvents": []map[string]any{
+			{"Type": 1, "Data": armored, "MemberID": "", "Signature": "", "Author": ""},
+		},
+	}
+}
+
+// testDaemonWithMockAPI builds a daemon whose client points at the mock
+// API and whose calendar keyring cache holds kr for cal1, so decrypts
+// of the mock events succeed without any real Proton credentials.
+func testDaemonWithMockAPI(t *testing.T, kr *crypto.KeyRing) *daemon {
+	t.Helper()
+	c, mgr, err := authedClient(context.Background())
+	if err != nil {
+		t.Fatalf("authedClient: %v", err)
+	}
+	t.Cleanup(func() {
+		c.Close()
+		mgr.Close()
+	})
+	return &daemon{
+		calKR:         map[string]*crypto.KeyRing{"cal1": kr},
+		client:        c,
+		mgr:           mgr,
+		icsPort:       8765,
+		icsPastDays:   30,
+		icsFutureDays: 365,
+		done:          make(chan struct{}),
+	}
+}
+
+func TestIntegrationDaemonICSFeed(t *testing.T) {
+	kr := testKeyRing(t)
+	now := time.Now()
+	timed := testEncryptedMockEvent(t, kr, "ev-feed",
+		now.Add(1*time.Hour).Unix(), now.Add(2*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Feed Test\nLOCATION:Room 9\nDESCRIPTION:Notes here\nEND:VEVENT")
+	// A full-day event tomorrow (midnight to midnight, exclusive end).
+	tomorrow := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+	day := testEncryptedMockEvent(t, kr, "ev-day",
+		tomorrow.Unix(), tomorrow.Add(24*time.Hour).Unix(), true,
+		"BEGIN:VEVENT\nSUMMARY:Day Off\nEND:VEVENT")
+	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{timed, day}}
+	newMockAPI(t, m)
+
+	d := testDaemonWithMockAPI(t, kr)
+	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/calendar.ics")
+	if err != nil {
+		t.Fatalf("GET /calendar.ics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /calendar.ics status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/calendar") {
+		t.Errorf("GET /calendar.ics Content-Type = %q, want text/calendar", ct)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read feed: %v", err)
+	}
+	feed := string(body)
+	for _, want := range []string{
+		"BEGIN:VCALENDAR",
+		"UID:ev-feed@proton-cli",
+		"SUMMARY:Feed Test",
+		"LOCATION:Room 9",
+		"DESCRIPTION:Notes here",
+		"UID:ev-day@proton-cli",
+		"SUMMARY:Day Off",
+		"DTSTART;VALUE=DATE:",
+		"END:VCALENDAR",
+	} {
+		if !strings.Contains(feed, want) {
+			t.Errorf("ICS feed missing %q in:\n%s", want, feed)
+		}
+	}
+	// The timed event uses DATETIME, not DATE.
+	if !strings.Contains(feed, "DTSTART:"+time.Unix(now.Add(1*time.Hour).Unix(), 0).UTC().Format("20060102T150405Z")) {
+		t.Errorf("ICS feed timed event missing DATETIME DTSTART in:\n%s", feed)
+	}
+}
+
+func TestIntegrationDaemonICSFeedFetchFailure(t *testing.T) {
+	// A fetch failure must serve 503 with a plain error, never a stale feed.
+	m := &mockAPI{t: t, calendarsErr: true}
+	newMockAPI(t, m)
+	d := testDaemonWithMockAPI(t, testKeyRing(t))
+	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/calendar.ics")
+	if err != nil {
+		t.Fatalf("GET /calendar.ics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("GET /calendar.ics status = %d, want 503", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read error body: %v", err)
+	}
+	if !strings.Contains(string(body), "failed to build feed") {
+		t.Errorf("GET /calendar.ics error body = %q, want it to mention the failed feed", body)
+	}
+}
+
+func TestIntegrationDaemonDecryptNoPrompt(t *testing.T) {
+	kr := testKeyRing(t)
+	now := time.Now()
+	from := now.Format("2006-01-02")
+	to := now.Add(48 * time.Hour).Format("2006-01-02")
+	ev := testEncryptedMockEvent(t, kr, "ev-daemon",
+		now.Add(1*time.Hour).Unix(), now.Add(2*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Daemon Test\nLOCATION:Room 2\nEND:VEVENT")
+	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{ev}}
+	newMockAPI(t, m)
+
+	d := testDaemonWithMockAPI(t, kr)
+	startTestDaemon(t, d)
+
+	// No stdin is provided: if the command prompted for the account
+	// password, readSecretLine would fail with "no input on stdin".
+	// Success proves the daemon served the decrypt.
+	out, err := captureStdout(t, func() error {
+		return cmdEvents(context.Background(), []string{
+			"--calendar", "cal1", "--from", from, "--to", to, "--decrypt",
+		})
+	})
+	if err != nil {
+		t.Fatalf("cmdEvents --decrypt via daemon: %v", err)
+	}
+	var got []eventSummary
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("cmdEvents output is not JSON: %v (%q)", err, out)
+	}
+	if len(got) != 1 {
+		t.Fatalf("cmdEvents via daemon returned %d events, want 1: %q", len(got), out)
+	}
+	if got[0].Summary != "Daemon Test" || got[0].Location != "Room 2" {
+		t.Errorf("cmdEvents via daemon = %q/%q, want Daemon Test/Room 2", got[0].Summary, got[0].Location)
+	}
+}
+
+func TestIntegrationEventsDecryptFallbackPrompts(t *testing.T) {
+	// No daemon running: --decrypt on a non-empty range must prompt for
+	// the account password. stdin is an empty reader, so the prompt
+	// fails with "no input on stdin" — proving the fallback prompts
+	// instead of silently succeeding.
+	oldReader := stdinReader
+	stdinReader = bufio.NewReader(strings.NewReader(""))
+	t.Cleanup(func() { stdinReader = oldReader })
+
+	dir := t.TempDir()
+	oldSock := daemonSocketPathOverride
+	daemonSocketPathOverride = filepath.Join(dir, "no-such.sock")
+	t.Cleanup(func() { daemonSocketPathOverride = oldSock })
+
+	m := &mockAPI{t: t, calendars: testCalendars(), events: testEvents()}
+	newMockAPI(t, m)
+	_, err := captureStdout(t, func() error {
+		return cmdEvents(context.Background(), []string{
+			"--calendar", "cal1", "--from", "2023-11-14", "--to", "2023-11-15", "--decrypt",
+		})
+	})
+	if err == nil {
+		t.Fatal("cmdEvents --decrypt with no daemon and no stdin: expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no input on stdin") {
+		t.Errorf("cmdEvents --decrypt fallback error = %v, want it to mention no input on stdin", err)
 	}
 }

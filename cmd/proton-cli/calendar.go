@@ -96,6 +96,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 	from := fs.String("from", "", "start date YYYY-MM-DD (default: today)")
 	to := fs.String("to", "", "end date YYYY-MM-DD exclusive (default: from + 1 day)")
 	decrypt := fs.Bool("decrypt", false, "decrypt event titles (reads account password from stdin)")
+	noDaemon := fs.Bool("no-daemon", false, "do not use the daemon; always prompt for the account password")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -139,8 +140,12 @@ func cmdEvents(ctx context.Context, args []string) error {
 	// after the first page is fetched, so a bad password still fails
 	// before the bulk of the (slow) multi-page fetch.
 	var calKR, addrKR *crypto.KeyRing
+	useDaemon := false
+	if *decrypt && !*noDaemon {
+		useDaemon, _ = pingDaemon()
+	}
 
-	if *decrypt {
+	if *decrypt && !useDaemon {
 		pw, err := readSecretLine("Enter account password (via stdin):")
 		if err != nil {
 			return err
@@ -275,9 +280,13 @@ func cmdEvents(ctx context.Context, args []string) error {
 			FullDay:   bool(ev.FullDay),
 		}
 
-		if *decrypt && calKR != nil {
+		if *decrypt {
 			var err error
-			s.Summary, s.Location, err = decryptEventDetails(&ev, calKR, addrKR)
+			if useDaemon {
+				s.Summary, s.Location, _, err = daemonDecryptEvent(*calendarID, &ev)
+			} else if calKR != nil {
+				s.Summary, s.Location, _, err = decryptEventDetails(&ev, calKR, addrKR)
+			}
 			if err != nil {
 				decryptFailed++
 				if firstDecryptErr == nil {
@@ -297,13 +306,17 @@ func cmdEvents(ctx context.Context, args []string) error {
 	return emitJSON(out)
 }
 
-// decryptEventDetails extracts the SUMMARY and LOCATION properties from an
-// event's decrypted iCal payload. The canonical body lives in SharedEvents,
-// encrypted with the shared session key (SharedKeyPacket); PersonalEvents
-// and CalendarEvents hold member annotations, encrypted with the calendar
-// session key (CalendarKeyPacket). Returns an error when no part could be
-// decrypted, or when parts decrypted but carried neither field.
-func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing) (summary, location string, err error) {
+// decryptEventDetails extracts the SUMMARY, LOCATION and DESCRIPTION
+// properties from an event's decrypted iCal payload. The canonical body
+// lives in SharedEvents, encrypted with the shared session key
+// (SharedKeyPacket); PersonalEvents and CalendarEvents hold member
+// annotations, encrypted with the calendar session key
+// (CalendarKeyPacket). Returns an error when no part could be decrypted,
+// or when parts decrypted but carried neither field. DESCRIPTION is
+// optional: it is captured when present in a part decrypted before the
+// early return below (the canonical VEVENT carries it alongside
+// SUMMARY/LOCATION).
+func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing) (summary, location, description string, err error) {
 	sharedKP := decodeKeyPacket(ev.SharedKeyPacket)
 	calKP := decodeKeyPacket(ev.CalendarKeyPacket)
 	partSets := []struct {
@@ -331,8 +344,11 @@ func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing
 			if location == "" {
 				location = icalProp(data, "LOCATION")
 			}
+			if description == "" {
+				description = icalProp(data, "DESCRIPTION")
+			}
 			if summary != "" && location != "" {
-				return summary, location, nil
+				return summary, location, description, nil
 			}
 		}
 	}
@@ -340,12 +356,12 @@ func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing
 		if err == nil {
 			err = fmt.Errorf("event has no parts to decrypt")
 		}
-		return summary, location, err
+		return summary, location, description, err
 	}
 	if summary == "" && location == "" {
-		return summary, location, fmt.Errorf("parts decrypted but no SUMMARY/LOCATION found")
+		return summary, location, description, fmt.Errorf("parts decrypted but no SUMMARY/LOCATION found")
 	}
-	return summary, location, nil
+	return summary, location, description, nil
 }
 
 // decodeKeyPacket base64-decodes a key packet string; returns nil for an

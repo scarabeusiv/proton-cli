@@ -142,12 +142,17 @@ func decryptAttachment(kr *crypto.KeyRing, att proton.Attachment, data []byte) (
 	return plain.GetBinary(), nil
 }
 
+// attachmentDecrypter decrypts one attachment's downloaded data packet.
+// It is a function so the same download loop serves both the local
+// keyring path and the daemon path.
+type attachmentDecrypter func(att proton.Attachment, data []byte) ([]byte, error)
+
 // downloadAttachments downloads and decrypts every attachment of msg
 // into dir, creating dir when needed, and fills in the Path of each
 // entry in atts (aligned with msg.Attachments by index). A failure on
 // any attachment aborts the download and reports which one failed;
 // files already written stay on disk.
-func downloadAttachments(ctx context.Context, c *proton.Client, kr *crypto.KeyRing, msg proton.Message, dir string, atts []attachmentInfo) error {
+func downloadAttachments(ctx context.Context, c *proton.Client, decrypt attachmentDecrypter, msg proton.Message, dir string, atts []attachmentInfo) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create attachments directory %s: %w", dir, err)
 	}
@@ -162,7 +167,7 @@ func downloadAttachments(ctx context.Context, c *proton.Client, kr *crypto.KeyRi
 		if err != nil {
 			return fmt.Errorf("download attachment %s (%s): %w", att.ID, att.Name, err)
 		}
-		plain, err := decryptAttachment(kr, att, data)
+		plain, err := decrypt(att, data)
 		if err != nil {
 			return err
 		}
