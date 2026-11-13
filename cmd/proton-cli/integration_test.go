@@ -421,6 +421,24 @@ func TestIntegrationEvents(t *testing.T) {
 	}
 }
 
+func TestIntegrationEventsDecryptEmptyRange(t *testing.T) {
+	// No events at all: --decrypt must not prompt for the account password.
+	m := &mockAPI{t: t, calendars: testCalendars(), events: nil}
+	newMockAPI(t, m)
+
+	out, err := captureStdout(t, func() error {
+		return cmdEvents(context.Background(), []string{
+			"--calendar", "cal1", "--from", "2023-11-14", "--to", "2023-11-15", "--decrypt",
+		})
+	})
+	if err != nil {
+		t.Fatalf("cmdEvents --decrypt on empty range: %v", err)
+	}
+	if strings.TrimSpace(out) != "[]" {
+		t.Errorf("cmdEvents --decrypt on empty range = %q, want []", out)
+	}
+}
+
 func TestIntegrationStatus(t *testing.T) {
 	m := &mockAPI{t: t, user: map[string]any{"ID": "u1", "DisplayName": "Tester", "Name": "Tester", "Email": "t@example.com"}}
 	newMockAPI(t, m)
@@ -509,7 +527,11 @@ func TestIntegrationListCalendarEventsPaging(t *testing.T) {
 	defer c.Close()
 	defer mgr.Close()
 
-	got, err := listCalendarEvents(context.Background(), c, "cal1", url.Values{})
+	first, err := c.GetCalendarEvents(context.Background(), "cal1", 0, calendarPageSize, url.Values{})
+	if err != nil {
+		t.Fatalf("GetCalendarEvents page 0: %v", err)
+	}
+	got, err := listCalendarEvents(context.Background(), c, "cal1", url.Values{}, first)
 	if err != nil {
 		t.Fatalf("listCalendarEvents: %v", err)
 	}
@@ -531,7 +553,11 @@ func TestIntegrationListCalendarEventsFailClosed(t *testing.T) {
 	defer c.Close()
 	defer mgr.Close()
 
-	_, err = listCalendarEvents(context.Background(), c, "cal1", url.Values{})
+	first, err := c.GetCalendarEvents(context.Background(), "cal1", 0, calendarPageSize, url.Values{})
+	if err != nil {
+		t.Fatalf("GetCalendarEvents page 0: %v", err)
+	}
+	_, err = listCalendarEvents(context.Background(), c, "cal1", url.Values{}, first)
 	if err == nil {
 		t.Fatal("listCalendarEvents with endless full pages: expected an error, got nil")
 	}

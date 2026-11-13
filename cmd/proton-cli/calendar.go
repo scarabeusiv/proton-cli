@@ -59,27 +59,35 @@ type eventSummary struct {
 	Location  string `json:"location,omitempty"`
 }
 
-// listCalendarEvents pages through the calendar API at a page size the
-// server accepts. The library's GetAllCalendarEvents uses PageSize=150,
-// which the calendar endpoint rejects (400 Code 2021). The page count is
-// capped: a server returning full pages forever would otherwise loop
-// forever and grow memory without bound. Failing closed (instead of
-// silently truncating) keeps a truncated list from passing as complete.
-func listCalendarEvents(ctx context.Context, c *proton.Client, calendarID string, filter url.Values) ([]proton.CalendarEvent, error) {
-	const pageSize = 100
+// calendarPageSize is the page size the calendar endpoint accepts.
+// The library's GetAllCalendarEvents uses PageSize=150, which the
+// calendar endpoint rejects (400 Code 2021).
+const calendarPageSize = 100
+
+// listCalendarEvents pages through the calendar API. first is the
+// already-fetched page 0; the remaining pages are fetched here, so the
+// caller can inspect page 0 (e.g. to skip a password prompt for an empty
+// range) without re-fetching it. The page count is capped: a server
+// returning full pages forever would otherwise loop forever and grow
+// memory without bound. Failing closed (instead of silently truncating)
+// keeps a truncated list from passing as complete.
+func listCalendarEvents(ctx context.Context, c *proton.Client, calendarID string, filter url.Values, first []proton.CalendarEvent) ([]proton.CalendarEvent, error) {
 	const maxPages = 100
-	var all []proton.CalendarEvent
-	for page := 0; page < maxPages; page++ {
-		evs, err := c.GetCalendarEvents(ctx, calendarID, page, pageSize, filter)
+	all := append([]proton.CalendarEvent{}, first...)
+	if len(first) < calendarPageSize {
+		return all, nil
+	}
+	for page := 1; page < maxPages; page++ {
+		evs, err := c.GetCalendarEvents(ctx, calendarID, page, calendarPageSize, filter)
 		if err != nil {
 			return nil, err
 		}
 		all = append(all, evs...)
-		if len(evs) < pageSize {
+		if len(evs) < calendarPageSize {
 			return all, nil
 		}
 	}
-	return nil, fmt.Errorf("calendar event list exceeded %d pages of %d events; refusing to fetch more", maxPages, pageSize)
+	return nil, fmt.Errorf("calendar event list exceeded %d pages of %d events; refusing to fetch more", maxPages, calendarPageSize)
 }
 
 func cmdEvents(ctx context.Context, args []string) error {
@@ -116,9 +124,20 @@ func cmdEvents(ctx context.Context, args []string) error {
 		"End":   []string{strconv.FormatInt(toT.Unix(), 10)},
 	}
 
+	// Fetch the first page before asking for the account password, so
+	// an empty range never prompts. A wrong password still fails fast:
+	// only this one cheap request happens before the prompt.
+	first, err := c.GetCalendarEvents(ctx, *calendarID, 0, calendarPageSize, filter)
+	if err != nil {
+		return fmt.Errorf("list events: %w", err)
+	}
+	if len(first) == 0 {
+		return emitJSON([]eventSummary{})
+	}
+
 	// Optional: set up calendar decryption so titles resolve. This runs
-	// BEFORE fetching events, so a bad password fails fast instead of
-	// after the (slow) multi-page fetch.
+	// after the first page is fetched, so a bad password still fails
+	// before the bulk of the (slow) multi-page fetch.
 	var calKR, addrKR *crypto.KeyRing
 
 	if *decrypt {
@@ -225,7 +244,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 		}
 	}
 
-	events, err := listCalendarEvents(ctx, c, *calendarID, filter)
+	events, err := listCalendarEvents(ctx, c, *calendarID, filter, first)
 	if err != nil {
 		return fmt.Errorf("list events: %w", err)
 	}
