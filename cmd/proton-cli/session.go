@@ -98,6 +98,10 @@ func authedClient(ctx context.Context) (*proton.Client, *proton.Manager, error) 
 		return nil, nil, fmt.Errorf("session refresh failed — run `proton-cli login` again: %w", err)
 	}
 
+	// Diagnostic: the access token's scope gates endpoints such as
+	// /core/v4/keys/salts (403 Code 9101 when insufficient). Not secret.
+	fmt.Fprintf(os.Stderr, "token scope: %s\n", auth.Scope)
+
 	if auth.RefreshToken != "" && auth.RefreshToken != s.RefreshToken {
 		_ = saveSession(session{UID: auth.UID, RefreshToken: auth.RefreshToken})
 	}
