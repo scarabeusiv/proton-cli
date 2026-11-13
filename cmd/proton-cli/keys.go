@@ -37,8 +37,9 @@ func cmdKeys(ctx context.Context, args []string) error {
 	for _, k := range user.Keys {
 		fmt.Println(formatKeyMeta(k.ID, bool(k.Primary), bool(k.Active), k.Token != ""))
 	}
-	if len(user.Keys) > 0 {
-		fmt.Printf("primary user key id: %s\n", user.Keys.Primary().ID)
+	// Primary() panics when no key is flagged primary.
+	if id := primaryKeyID(user.Keys); id != "" {
+		fmt.Printf("primary user key id: %s\n", id)
 	}
 
 	addrs, err := c.GetAddresses(ctx)
