@@ -32,6 +32,10 @@ the session, because a refreshed token cannot fetch them later.
 
 - `login` / `logout` / `status` — authenticate, revoke, check the session
 - `mail` — list / read / send mail
+  - `mail read [--decrypt] <message-id>` — attachment metadata is always listed; `--download-attachments` writes the attachments decrypted into `<message-id>-attachments` (or `--attachments-dir DIR`); requires `--decrypt`
+  - `mail send --to ... --subject ... --body-file ... [--attach FILE]...` — attach files (repeatable)
+  - `mail mark-read | mark-unread | delete <message-id>...` — triage, several IDs per call
+  - `mail labels` — list labels; `mail label <id>... --add <label-id> [--remove <label-id>]`; `mail create-label --name <name> [--color <hex>]`
 - `calendars` — list Proton calendars
 - `events` — list calendar events in a date range; `--decrypt` decrypts
   titles and locations (account password via stdin, asked only when the
