@@ -51,5 +51,6 @@ the session, because a refreshed token cannot fetch them later.
   session file and Proton rotates refresh tokens, so each process's
   refresh invalidates the others' access tokens. Run exports
   sequentially.
-- The server ignores the Begin/End date filter on the events endpoint;
-  filter locally.
+- `events` passes Begin/End to the server and additionally filters the
+  results locally, so it only ever returns events overlapping the
+  requested date range.

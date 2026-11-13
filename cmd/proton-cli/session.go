@@ -181,10 +181,20 @@ func zero(b []byte) {
 	}
 }
 
-// unlockAddressKeyring unlocks the user's address keyrings with the mailbox
-// password (usually the login password) and returns the keyring for the given
-// address ID, or the first usable one when addressID is empty.
-// unlockAddressKeyring unlocks the address keyring for addressID.
+// primaryKeyID returns the ID of the key flagged primary, or "" when
+// none is. proton.Keys.Primary panics when no key is primary, so call
+// sites must use this instead of calling Primary() directly.
+func primaryKeyID(keys proton.Keys) string {
+	for _, k := range keys {
+		if k.Primary {
+			return k.ID
+		}
+	}
+	return ""
+}
+
+// unlockAddressKeyring unlocks the address keyring for addressID and
+// returns it, or the first usable address keyring when addressID is empty.
 // keyPass is the SALTED key password (see SaltForKey in calendar.go),
 // not the raw mailbox password.
 func unlockAddressKeyring(ctx context.Context, c *proton.Client, keyPass []byte, addressID string) (*crypto.KeyRing, error) {
