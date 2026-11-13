@@ -208,7 +208,7 @@ func TestSummarize(t *testing.T) {
 
 func TestDecryptEventDetailsNoParts(t *testing.T) {
 	ev := &proton.CalendarEvent{ID: "ev1"}
-	summary, location, err := decryptEventDetails(ev, nil, nil)
+	summary, location, _, err := decryptEventDetails(ev, nil, nil)
 	if err == nil {
 		t.Fatal("decryptEventDetails with no parts: expected error, got nil")
 	}
@@ -226,15 +226,15 @@ func TestDecryptEventDetailsPlainPart(t *testing.T) {
 	ev := &proton.CalendarEvent{
 		ID: "ev1",
 		SharedEvents: []proton.CalendarEventPart{
-			{Type: 0, Data: "BEGIN:VEVENT\nSUMMARY:Hello\nLOCATION:Paris\nEND:VEVENT"},
+			{Type: 0, Data: "BEGIN:VEVENT\nSUMMARY:Hello\nLOCATION:Paris\nDESCRIPTION:See you there\nEND:VEVENT"},
 		},
 	}
-	summary, location, err := decryptEventDetails(ev, nil, nil)
+	summary, location, description, err := decryptEventDetails(ev, nil, nil)
 	if err != nil {
 		t.Fatalf("decryptEventDetails plain part error: %v", err)
 	}
-	if summary != "Hello" || location != "Paris" {
-		t.Errorf("decryptEventDetails = %q/%q, want Hello/Paris", summary, location)
+	if summary != "Hello" || location != "Paris" || description != "See you there" {
+		t.Errorf("decryptEventDetails = %q/%q/%q, want Hello/Paris/See you there", summary, location, description)
 	}
 }
 
@@ -245,7 +245,7 @@ func TestDecryptEventDetailsPlainPartNoFields(t *testing.T) {
 			{Type: 0, Data: "BEGIN:VEVENT\nUID:x\nEND:VEVENT"},
 		},
 	}
-	_, _, err := decryptEventDetails(ev, nil, nil)
+	_, _, _, err := decryptEventDetails(ev, nil, nil)
 	if err == nil {
 		t.Fatal("decryptEventDetails with no SUMMARY/LOCATION: expected error, got nil")
 	}

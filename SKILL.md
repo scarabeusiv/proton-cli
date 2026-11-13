@@ -25,8 +25,13 @@ proton-cli mail label <message-id>... --add <label-id> [--remove <label-id>]
 proton-cli mail create-label --name <name> [--color <hex>]
 
 proton-cli calendars
-proton-cli events --calendar ID [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--decrypt]
+proton-cli events --calendar ID [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--decrypt] [--no-daemon]
 proton-cli contacts [--query X] [--limit N]
+
+proton-cli daemon start [--ics-port 8765] [--ics-days-past 30] [--ics-days-future 365]  # unlock once, hold keyrings in memory
+proton-cli daemon stop
+proton-cli daemon status
+proton-cli daemon ics   # print the ICS feed URL and Apple Calendar subscription steps
 ```
 
 Most commands emit JSON on stdout; errors go to stderr. The `keys` and
@@ -41,6 +46,7 @@ First-time setup needs the user's Proton password (and TOTP code if 2FA is on) s
 1. Secrets only ever travel via stdin pipes. Never put passwords, TOTP codes, or account passwords in argv, environment variables, files, chat messages, or logs.
 2. Never send email without showing the user the exact draft and receiving their approval first.
 3. Calendar is read-only in this integration: list calendars and fetch events only. Do not attempt event create/update/delete — the library has no such endpoints.
-4. `mail read` without `--decrypt` returns metadata + headers only; bodies need the account password (usually the login password), asked for transiently each time. Attachment metadata (name, size, MIME type) is listed without a password; `--download-attachments` writes the attachments decrypted into `<message-id>-attachments` (or `--attachments-dir DIR`) and needs `--decrypt`.
-5. If a command reports `session_invalid`, run `login` again — do not retry blindly.
-6. Account password failures ("wrong account password?") mean unlocking the keys failed. The salted key password is derived from the account password with the salts stored in the session, so a session without salts, or a call that passes the raw password where the salted one is required, fails the same way. Check the salts and the unlock path before asking the user to re-enter the password.
+4. `mail read` without `--decrypt` returns metadata + headers only; bodies need the account password (usually the login password), asked for transiently each time — unless the daemon is running, in which case it decrypts without prompting (`--no-daemon` forces the prompt). Attachment metadata (name, size, MIME type) is listed without a password; `--download-attachments` writes the attachments decrypted into `<message-id>-attachments` (or `--attachments-dir DIR`) and needs `--decrypt`.
+5. The daemon (`daemon start`) holds the unlocked keyrings in memory so decrypt commands stop prompting; it also serves a read-only ICS feed on 127.0.0.1 (`daemon ics` prints the URL and Apple Calendar steps). The feed exists only while the daemon runs. Any process as the same user can ask the daemon to decrypt — the same gap ssh-agent, gpg-agent and Proton Bridge have. Nothing decrypted is ever written to disk.
+6. If a command reports `session_invalid`, run `login` again — do not retry blindly.
+7. Account password failures ("wrong account password?") mean unlocking the keys failed. The salted key password is derived from the account password with the salts stored in the session, so a session without salts, or a call that passes the raw password where the salted one is required, fails the same way. Check the salts and the unlock path before asking the user to re-enter the password.
