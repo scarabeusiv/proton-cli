@@ -376,7 +376,7 @@ func TestLoadSessionErrors(t *testing.T) {
 // (nil, nil) — no error, empty result — when the salt entry exists with
 // an empty KeySalt. Callers must therefore check len(salted) == 0 after
 // SaltForKey, not just err; a nil salted password cannot unlock anything
-// and only fails later as a misleading "wrong mailbox password?" error.
+// and only fails later as a misleading "wrong account password?" error.
 func TestSaltForKey(t *testing.T) {
 	// No salt for the key: an error, not a silent nil.
 	if out, err := (proton.Salts{}).SaltForKey([]byte("password"), "no-such-key"); err == nil {

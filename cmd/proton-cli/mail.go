@@ -135,7 +135,7 @@ func cmdMailList(ctx context.Context, args []string) error {
 
 func cmdMailRead(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mail read", flag.ContinueOnError)
-	decrypt := fs.Bool("decrypt", false, "decrypt the body (reads mailbox password from stdin)")
+	decrypt := fs.Bool("decrypt", false, "decrypt the body (reads account password from stdin)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -162,13 +162,13 @@ func cmdMailRead(ctx context.Context, args []string) error {
 	}
 
 	if *decrypt {
-		mbpw, err := readSecretLine("Enter mailbox password (via stdin):")
+		pw, err := readSecretLine("Enter account password (via stdin):")
 		if err != nil {
 			return err
 		}
-		defer zero(mbpw)
+		defer zero(pw)
 
-		// The key password is the SALTED password, not the raw mailbox
+		// The key password is the SALTED password, not the raw account
 		// password: derive it from the salts captured at login.
 		stored, err := loadSession()
 		if err != nil {
@@ -185,7 +185,7 @@ func cmdMailRead(ctx context.Context, args []string) error {
 		if primaryID == "" {
 			return fmt.Errorf("no primary user key — cannot derive salted key password")
 		}
-		salted, err := stored.Salts.SaltForKey(mbpw, primaryID)
+		salted, err := stored.Salts.SaltForKey(pw, primaryID)
 		if err != nil {
 			return fmt.Errorf("derive salted key password: %w", err)
 		}
@@ -248,11 +248,11 @@ func cmdMailSend(ctx context.Context, args []string) error {
 		return err
 	}
 
-	mbpw, err := readSecretLine("Enter mailbox password (via stdin) — needed to encrypt the draft:")
+	pw, err := readSecretLine("Enter account password (via stdin) — needed to encrypt the draft:")
 	if err != nil {
 		return err
 	}
-	defer zero(mbpw)
+	defer zero(pw)
 
 	c, m, err := authedClient(ctx)
 	if err != nil {
@@ -284,7 +284,7 @@ func cmdMailSend(ctx context.Context, args []string) error {
 		}
 	}
 
-	// The key password is the SALTED password, not the raw mailbox
+	// The key password is the SALTED password, not the raw account
 	// password: derive it from the salts captured at login.
 	stored, err := loadSession()
 	if err != nil {
@@ -301,7 +301,7 @@ func cmdMailSend(ctx context.Context, args []string) error {
 	if primaryID == "" {
 		return fmt.Errorf("no primary user key — cannot derive salted key password")
 	}
-	salted, err := stored.Salts.SaltForKey(mbpw, primaryID)
+	salted, err := stored.Salts.SaltForKey(pw, primaryID)
 	if err != nil {
 		return fmt.Errorf("derive salted key password: %w", err)
 	}

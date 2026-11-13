@@ -21,7 +21,7 @@ type session struct {
 	// Key salts, captured at login time. /core/v4/keys/salts requires a
 	// short-lived post-login "password scope" that a refreshed token does
 	// not carry, so they cannot be fetched by a later run. Salts are
-	// per-key bcrypt salts; without the mailbox password they unlock
+	// per-key bcrypt salts; without the account password they unlock
 	// nothing. Re-captured on every login.
 	Salts proton.Salts `json:"salts,omitempty"`
 }
@@ -196,7 +196,7 @@ func primaryKeyID(keys proton.Keys) string {
 // unlockAddressKeyring unlocks the address keyring for addressID and
 // returns it, or the first usable address keyring when addressID is empty.
 // keyPass is the SALTED key password (see SaltForKey in calendar.go),
-// not the raw mailbox password.
+// not the raw account password.
 func unlockAddressKeyring(ctx context.Context, c *proton.Client, keyPass []byte, addressID string) (*crypto.KeyRing, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
@@ -217,7 +217,7 @@ func unlockAddressKeyring(ctx context.Context, c *proton.Client, keyPass []byte,
 func unlockAddressKeyringForAddrs(keyPass []byte, addressID string, user proton.User, addrs []proton.Address) (*crypto.KeyRing, error) {
 	userKR, err := user.Keys.Unlock(keyPass, nil)
 	if err != nil {
-		return nil, fmt.Errorf("unlock user keys (wrong mailbox password?): %w", err)
+		return nil, fmt.Errorf("unlock user keys (wrong account password?): %w", err)
 	}
 
 	for _, addr := range addrs {

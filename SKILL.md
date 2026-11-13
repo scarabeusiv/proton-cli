@@ -17,7 +17,7 @@ proton-cli logout                             # revoke + delete local session
 proton-cli status                             # check session health
 
 proton-cli mail list [--label ID] [--unread] [--subject-substr X] [--from X] [--limit N]
-proton-cli mail read [--decrypt] <message-id> # --decrypt reads mailbox password from stdin
+proton-cli mail read [--decrypt] <message-id> # --decrypt reads account password from stdin
 proton-cli mail send --to a@b [--cc c@d] --subject S --body-file PATH [--from addr]
 
 proton-cli calendars
@@ -34,9 +34,9 @@ No connector exists for Proton (username+password SRP login is not a supported c
 First-time setup needs the user's Proton password (and TOTP code if 2FA is on) supplied transiently — never stored, never logged. Ask for it only when actually running `login`.
 
 ## Operating Rules
-1. Secrets only ever travel via stdin pipes. Never put passwords, TOTP codes, or mailbox passwords in argv, environment variables, files, chat messages, or logs.
+1. Secrets only ever travel via stdin pipes. Never put passwords, TOTP codes, or account passwords in argv, environment variables, files, chat messages, or logs.
 2. Never send email without showing the user the exact draft and receiving their approval first.
 3. Calendar is read-only in this integration: list calendars and fetch events only. Do not attempt event create/update/delete — the library has no such endpoints.
-4. `mail read` without `--decrypt` returns metadata + headers only; bodies need the mailbox password (usually the login password), asked for transiently each time.
+4. `mail read` without `--decrypt` returns metadata + headers only; bodies need the account password (usually the login password), asked for transiently each time.
 5. If a command reports `session_invalid`, run `login` again — do not retry blindly.
-6. Mailbox password failures ("wrong mailbox password?") mean unlocking the keys failed — not necessarily that the login and mailbox passwords differ. The salted key password is derived from the mailbox password with the salts stored in the session, so a session without salts, or a call that passes the raw password where the salted one is required, fails the same way. Check the salts and the unlock path before asking the user about differing passwords.
+6. Account password failures ("wrong account password?") mean unlocking the keys failed. The salted key password is derived from the account password with the salts stored in the session, so a session without salts, or a call that passes the raw password where the salted one is required, fails the same way. Check the salts and the unlock path before asking the user to re-enter the password.
