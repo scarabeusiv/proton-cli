@@ -95,30 +95,37 @@ func cmdMailList(ctx context.Context, args []string) error {
 		filter.LabelID = *label
 	}
 
-	metas, err := c.GetMessageMetadata(ctx, filter)
-	if err != nil {
-		return fmt.Errorf("list messages: %w", err)
-	}
-
+	// Page through metadata and stop once the limit is reached, instead
+	// of fetching the whole mailbox and limiting client-side.
+	const mailPageSize = 100
 	out := make([]mailSummary, 0, limit)
-	for _, mm := range metas {
-		if *unreadOnly && !bool(mm.Unread) {
-			continue
+	for page := 0; ; page++ {
+		metas, err := c.GetMessageMetadataPage(ctx, page, mailPageSize, filter)
+		if err != nil {
+			return fmt.Errorf("list messages: %w", err)
 		}
-		if *subject != "" && !strings.Contains(strings.ToLower(mm.Subject), strings.ToLower(*subject)) {
-			continue
-		}
-		if *from != "" {
-			sender := ""
-			if mm.Sender != nil {
-				sender = strings.ToLower(mm.Sender.Address + " " + mm.Sender.Name)
-			}
-			if !strings.Contains(sender, strings.ToLower(*from)) {
+		for _, mm := range metas {
+			if *unreadOnly && !bool(mm.Unread) {
 				continue
 			}
+			if *subject != "" && !strings.Contains(strings.ToLower(mm.Subject), strings.ToLower(*subject)) {
+				continue
+			}
+			if *from != "" {
+				sender := ""
+				if mm.Sender != nil {
+					sender = strings.ToLower(mm.Sender.Address + " " + mm.Sender.Name)
+				}
+				if !strings.Contains(sender, strings.ToLower(*from)) {
+					continue
+				}
+			}
+			out = append(out, summarize(mm))
+			if limit > 0 && len(out) >= limit {
+				return emitJSON(out)
+			}
 		}
-		out = append(out, summarize(mm))
-		if limit > 0 && len(out) >= limit {
+		if len(metas) < mailPageSize {
 			break
 		}
 	}
