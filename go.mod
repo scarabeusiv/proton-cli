@@ -3,8 +3,8 @@ module github.com/scarabeusiv/proton-cli
 go 1.27
 
 require (
-	github.com/ProtonMail/gluon v0.0.0-20260910132611-39e5c6ac84fe
-	github.com/ProtonMail/go-proton-api v0.0.0-20260916131751-882710fb04bb
+	github.com/ProtonMail/gluon v0.13.1-0.20221025093924-86bbf0261eb8
+	github.com/ProtonMail/go-proton-api v0.4.0
 	github.com/ProtonMail/gopenpgp/v2 v2.10.0-proton
 )
 
@@ -25,7 +25,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
-	gitlab.com/c0b/go-ordered-json v0.0.0-20201030195603-febf46534d5a // indirect
 	golang.org/x/crypto v0.51.0 // indirect
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
 	golang.org/x/net v0.55.0 // indirect
