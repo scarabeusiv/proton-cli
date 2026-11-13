@@ -79,13 +79,20 @@ func sanitizeAttachmentName(name string) string {
 // uniqueAttachmentPath returns a path inside dir for name that does not
 // collide with a file already on disk or one already claimed in this
 // run (tracked in used). A colliding name gets a numeric suffix before
-// its extension: report.pdf, report-2.pdf, report-3.pdf.
-func uniqueAttachmentPath(dir, name string, used map[string]bool) string {
+// its extension: report.pdf, report-2.pdf, report-3.pdf. A stat error
+// other than "not exist" (e.g. the directory is unreadable) is returned
+// instead of looping: every candidate would fail the same way and the
+// suffix loop would never terminate.
+func uniqueAttachmentPath(dir, name string, used map[string]bool) (string, error) {
 	candidate := filepath.Join(dir, name)
 	if !used[candidate] {
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+		free, err := pathFree(candidate)
+		if err != nil {
+			return "", err
+		}
+		if free {
 			used[candidate] = true
-			return candidate
+			return candidate, nil
 		}
 	}
 	ext := filepath.Ext(name)
@@ -95,11 +102,28 @@ func uniqueAttachmentPath(dir, name string, used map[string]bool) string {
 		if used[candidate] {
 			continue
 		}
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+		free, err := pathFree(candidate)
+		if err != nil {
+			return "", err
+		}
+		if free {
 			used[candidate] = true
-			return candidate
+			return candidate, nil
 		}
 	}
+}
+
+// pathFree reports whether no file exists at path. A stat error other
+// than "not exist" is returned as an error.
+func pathFree(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return false, nil
+	}
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	return false, err
 }
 
 // decryptAttachment decrypts a downloaded attachment: the attachment's
@@ -142,7 +166,10 @@ func downloadAttachments(ctx context.Context, c *proton.Client, kr *crypto.KeyRi
 		if err != nil {
 			return err
 		}
-		path := uniqueAttachmentPath(dir, name, used)
+		path, err := uniqueAttachmentPath(dir, name, used)
+		if err != nil {
+			return fmt.Errorf("attachment %s (%s): %w", att.ID, att.Name, err)
+		}
 		if err := os.WriteFile(path, plain, 0o600); err != nil {
 			return fmt.Errorf("write attachment %s: %w", path, err)
 		}

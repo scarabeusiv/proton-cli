@@ -36,24 +36,32 @@ func TestSanitizeAttachmentName(t *testing.T) {
 func TestUniqueAttachmentPath(t *testing.T) {
 	dir := t.TempDir()
 	used := make(map[string]bool)
+	claim := func(name string, used map[string]bool) string {
+		t.Helper()
+		got, err := uniqueAttachmentPath(dir, name, used)
+		if err != nil {
+			t.Fatalf("uniqueAttachmentPath(%q) error: %v", name, err)
+		}
+		return got
+	}
 
 	// First claim of a name is used as-is.
-	if got := uniqueAttachmentPath(dir, "report.pdf", used); got != filepath.Join(dir, "report.pdf") {
+	if got := claim("report.pdf", used); got != filepath.Join(dir, "report.pdf") {
 		t.Errorf("first claim = %q, want %q", got, filepath.Join(dir, "report.pdf"))
 	}
 	// Second claim of the same name gets -2.
-	if got := uniqueAttachmentPath(dir, "report.pdf", used); got != filepath.Join(dir, "report-2.pdf") {
+	if got := claim("report.pdf", used); got != filepath.Join(dir, "report-2.pdf") {
 		t.Errorf("second claim = %q, want %q", got, filepath.Join(dir, "report-2.pdf"))
 	}
 	// Third claim gets -3.
-	if got := uniqueAttachmentPath(dir, "report.pdf", used); got != filepath.Join(dir, "report-3.pdf") {
+	if got := claim("report.pdf", used); got != filepath.Join(dir, "report-3.pdf") {
 		t.Errorf("third claim = %q, want %q", got, filepath.Join(dir, "report-3.pdf"))
 	}
 	// A name without an extension gets the suffix appended, not an extension.
-	if got := uniqueAttachmentPath(dir, "notes", used); got != filepath.Join(dir, "notes") {
+	if got := claim("notes", used); got != filepath.Join(dir, "notes") {
 		t.Errorf("extensionless first claim = %q, want %q", got, filepath.Join(dir, "notes"))
 	}
-	if got := uniqueAttachmentPath(dir, "notes", used); got != filepath.Join(dir, "notes-2") {
+	if got := claim("notes", used); got != filepath.Join(dir, "notes-2") {
 		t.Errorf("extensionless second claim = %q, want %q", got, filepath.Join(dir, "notes-2"))
 	}
 
@@ -62,8 +70,22 @@ func TestUniqueAttachmentPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	fresh := make(map[string]bool)
-	if got := uniqueAttachmentPath(dir, "existing.txt", fresh); got != filepath.Join(dir, "existing-2.txt") {
+	if got := claim("existing.txt", fresh); got != filepath.Join(dir, "existing-2.txt") {
 		t.Errorf("on-disk collision = %q, want %q", got, filepath.Join(dir, "existing-2.txt"))
+	}
+
+	// An unreadable directory must error out, not loop forever: every
+	// candidate stat fails the same way. (Skipped for root, which can
+	// stat regardless of permissions.)
+	if os.Geteuid() != 0 {
+		bad := t.TempDir()
+		if err := os.Chmod(bad, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(bad, 0o700)
+		if _, err := uniqueAttachmentPath(bad, "x.txt", make(map[string]bool)); err == nil {
+			t.Error("uniqueAttachmentPath in an unreadable directory: expected an error, got nil")
+		}
 	}
 }
 
