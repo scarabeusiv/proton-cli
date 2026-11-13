@@ -10,7 +10,7 @@ by Tom (2026-09-19); handling must be airtight.
 ## What is stored
 `~/.config/proton-cli/session.json` (mode 0600, outside the git repo):
 ```json
-{"uid": "...", "refresh_token": "..."}
+{"uid": "...", "refresh_token": "...", "salts": [{"ID": "...", "KeySalt": "..."}]}
 ```
 - Created once by `proton-cli login`.
 - The **password is never stored**. Every command refreshes the access token
@@ -43,7 +43,7 @@ password step. The resulting session is a normal refreshable session — 2FA is
 only needed at login time.
 
 ## Scope limits of this integration
-- Mail: full (list/search metadata, read incl. decrypted bodies, send, drafts).
+- Mail: full (list/search metadata, read incl. decrypted bodies, send — sending creates a draft internally as part of the send; there is no standalone draft command).
 - Calendar: read-only (list calendars, fetch events incl. decrypted titles).
   No create/update/delete — the library exposes no such endpoints.
 - Contacts: read.
