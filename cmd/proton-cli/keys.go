@@ -35,7 +35,7 @@ func cmdKeys(ctx context.Context, args []string) error {
 
 	fmt.Printf("user keys: %d\n", len(user.Keys))
 	for _, k := range user.Keys {
-		fmt.Printf("  id=%s primary=%v active=%v has_token=%v\n", k.ID, bool(k.Primary), bool(k.Active), k.Token != "")
+		fmt.Println(formatKeyMeta(k.ID, bool(k.Primary), bool(k.Active), k.Token != ""))
 	}
 	if len(user.Keys) > 0 {
 		fmt.Printf("primary user key id: %s\n", user.Keys.Primary().ID)
@@ -48,9 +48,16 @@ func cmdKeys(ctx context.Context, args []string) error {
 	for _, addr := range addrs {
 		fmt.Printf("address %s (%s) keys: %d\n", addr.Email, addr.ID, len(addr.Keys))
 		for _, k := range addr.Keys {
-			fmt.Printf("  id=%s primary=%v active=%v has_token=%v\n", k.ID, bool(k.Primary), bool(k.Active), k.Token != "")
+			fmt.Println(formatKeyMeta(k.ID, bool(k.Primary), bool(k.Active), k.Token != ""))
 		}
 	}
 
 	return nil
+}
+
+// formatKeyMeta renders one key's diagnostic line. The format string and
+// the arguments are kept together here so a verb/argument mismatch cannot
+// creep back in unnoticed (go vet also checks this).
+func formatKeyMeta(id string, primary, active, hasToken bool) string {
+	return fmt.Sprintf("  id=%s primary=%v active=%v has_token=%v", id, primary, active, hasToken)
 }
