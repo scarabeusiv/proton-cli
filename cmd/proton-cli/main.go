@@ -22,7 +22,13 @@ func main() {
 		os.Exit(2)
 	}
 
-	ctx := context.Background()
+	// The root context carries a timeout so a hung API call cannot hang
+	// the CLI indefinitely. It is deliberately generous (10 minutes):
+	// login may block on stdin while the user solves a human-verification
+	// CAPTCHA in the browser, and the retry after that still uses this
+	// context.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
 
 	var err error
 
