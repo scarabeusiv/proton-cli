@@ -53,6 +53,26 @@ type eventSummary struct {
 	EndText   string `json:"end_rfc3339"`
 	FullDay   bool   `json:"full_day"`
 	Summary   string `json:"summary,omitempty"`
+	Location  string `json:"location,omitempty"`
+}
+
+// listCalendarEvents pages through the calendar API at a page size the
+// server accepts. The library's GetAllCalendarEvents uses PageSize=150,
+// which the calendar endpoint rejects (400 Code 2021).
+func listCalendarEvents(ctx context.Context, c *proton.Client, calendarID string, filter url.Values) ([]proton.CalendarEvent, error) {
+	const pageSize = 100
+	var all []proton.CalendarEvent
+	for page := 0; ; page++ {
+		evs, err := c.GetCalendarEvents(ctx, calendarID, page, pageSize, filter)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, evs...)
+		if len(evs) < pageSize {
+			break
+		}
+	}
+	return all, nil
 }
 
 func cmdEvents(ctx context.Context, args []string) error {
@@ -89,7 +109,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 		"End":   []string{strconv.FormatInt(toT.Unix(), 10)},
 	}
 
-	events, err := c.GetAllCalendarEvents(ctx, *calendarID, filter)
+	events, err := listCalendarEvents(ctx, c, *calendarID, filter)
 	if err != nil {
 		return fmt.Errorf("list events: %w", err)
 	}
@@ -172,7 +192,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 		}
 
 		if *decrypt && calKR != nil {
-			s.Summary = decryptEventSummary(&ev, calKR, addrKR)
+			s.Summary, s.Location = decryptEventDetails(&ev, calKR, addrKR)
 		}
 
 		out = append(out, s)
@@ -181,25 +201,31 @@ func cmdEvents(ctx context.Context, args []string) error {
 	return emitJSON(out)
 }
 
-// decryptEventSummary decodes the personal event part and extracts the
-// SUMMARY property from the iCal payload. Best effort: returns "" when the
-// event has no personal part or decoding fails.
-func decryptEventSummary(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing) string {
+// decryptEventDetails decodes the personal event part and extracts the
+// SUMMARY and LOCATION properties from the iCal payload. Best effort:
+// returns "" for anything missing or undecodable.
+func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing) (summary, location string) {
 	for i := range ev.PersonalEvents {
 		part := &ev.PersonalEvents[i]
 		if err := part.Decode(calKR, addrKR, nil); err != nil {
 			continue
 		}
-		if summary := icalSummary(part.Data); summary != "" {
-			return summary
+		if summary == "" {
+			summary = icalProp(part.Data, "SUMMARY")
+		}
+		if location == "" {
+			location = icalProp(part.Data, "LOCATION")
+		}
+		if summary != "" && location != "" {
+			break
 		}
 	}
-	return ""
+	return summary, location
 }
 
-// icalSummary pulls the SUMMARY: line out of an iCal VEVENT payload,
+// icalProp pulls the named property out of an iCal VEVENT payload,
 // unfolding continuation lines.
-func icalSummary(ical string) string {
+func icalProp(ical, prop string) string {
 	var unfolded []string
 	var current string
 
@@ -230,7 +256,7 @@ func icalSummary(ical string) string {
 		if idx := indexOf(name, ';'); idx >= 0 {
 			name = name[:idx]
 		}
-		if name == "SUMMARY" {
+		if name == prop {
 			if idx := indexOf(line, ':'); idx >= 0 {
 				return unescapeICalText(line[idx+1:])
 			}
