@@ -39,6 +39,8 @@ func main() {
 		err = cmdCalendars(ctx, os.Args[2:])
 	case "events":
 		err = cmdEvents(ctx, os.Args[2:])
+	case "event-raw":
+		err = cmdEventRaw(ctx, os.Args[2:])
 	case "keys":
 		err = cmdKeys(ctx, os.Args[2:])
 	case "contacts":
@@ -71,6 +73,7 @@ Commands:
   mail       Mail operations: list | read | send
   calendars  List Proton calendars
   events     List calendar events in a date range (read-only)
+  event-raw  Diagnostic: print one event's part structure (no decrypt, no password)
   keys       Diagnostic: list key IDs/flags and stored key-salt IDs (no secrets)
   contacts   List/search contacts
 
