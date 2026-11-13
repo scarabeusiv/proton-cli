@@ -63,7 +63,12 @@ func saveSession(s session) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	// MkdirAll leaves an existing directory's mode alone; enforce 0700.
+	if err := os.Chmod(dir, 0o700); err != nil {
 		return err
 	}
 
@@ -72,7 +77,11 @@ func saveSession(s session) error {
 		return err
 	}
 
-	return os.WriteFile(p, b, 0o600)
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		return err
+	}
+	// WriteFile leaves an existing file's mode alone; enforce 0600.
+	return os.Chmod(p, 0o600)
 }
 
 func clearSession() error {
