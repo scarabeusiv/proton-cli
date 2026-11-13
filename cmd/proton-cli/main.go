@@ -39,6 +39,8 @@ func main() {
 		err = cmdCalendars(ctx, os.Args[2:])
 	case "events":
 		err = cmdEvents(ctx, os.Args[2:])
+	case "keys":
+		err = cmdKeys(ctx, os.Args[2:])
 	case "contacts":
 		err = cmdContacts(ctx, os.Args[2:])
 	case "help", "-h", "--help":
@@ -69,6 +71,7 @@ Commands:
   mail       Mail operations: list | read | send
   calendars  List Proton calendars
   events     List calendar events in a date range (read-only)
+  keys       Diagnostic: list key IDs/flags and stored key-salt IDs (no secrets)
   contacts   List/search contacts
 
 Secrets are only read from stdin, never from argv or the environment.
