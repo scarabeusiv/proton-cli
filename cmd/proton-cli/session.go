@@ -155,13 +155,16 @@ func zero(b []byte) {
 // unlockAddressKeyring unlocks the user's address keyrings with the mailbox
 // password (usually the login password) and returns the keyring for the given
 // address ID, or the first usable one when addressID is empty.
-func unlockAddressKeyring(ctx context.Context, c *proton.Client, mailboxPassword []byte, addressID string) (*crypto.KeyRing, error) {
+// unlockAddressKeyring unlocks the address keyring for addressID.
+// keyPass is the SALTED key password (see SaltForKey in calendar.go),
+// not the raw mailbox password.
+func unlockAddressKeyring(ctx context.Context, c *proton.Client, keyPass []byte, addressID string) (*crypto.KeyRing, error) {
 	user, err := c.GetUser(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get user: %w", err)
 	}
 
-	userKR, err := user.Keys.Unlock(mailboxPassword, nil)
+	userKR, err := user.Keys.Unlock(keyPass, nil)
 	if err != nil {
 		return nil, fmt.Errorf("unlock user keys (wrong mailbox password?): %w", err)
 	}
@@ -176,7 +179,7 @@ func unlockAddressKeyring(ctx context.Context, c *proton.Client, mailboxPassword
 			continue
 		}
 
-		if kr := addr.Keys.TryUnlock(mailboxPassword, userKR); kr != nil && kr.CountDecryptionEntities() > 0 {
+		if kr := addr.Keys.TryUnlock(keyPass, userKR); kr != nil && kr.CountDecryptionEntities() > 0 {
 			return kr, nil
 		}
 	}
