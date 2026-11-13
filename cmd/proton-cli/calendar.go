@@ -239,27 +239,31 @@ func cmdEvents(ctx context.Context, args []string) error {
 }
 
 // decryptEventDetails extracts the SUMMARY and LOCATION properties from an
-// event's decrypted iCal payload. The canonical body lives in SharedEvents;
-// PersonalEvents and CalendarEvents hold member annotations and are tried
-// as a fallback. Returns an error when no part could be decrypted.
+// event's decrypted iCal payload. The canonical body lives in SharedEvents,
+// encrypted with the shared session key (SharedKeyPacket); PersonalEvents
+// and CalendarEvents hold member annotations, encrypted with the calendar
+// session key (CalendarKeyPacket). Returns an error when no part could be
+// decrypted, or when parts decrypted but carried neither field.
 func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing) (summary, location string, err error) {
-	// Decode the calendar key packet without the library helper, which
-	// panics on malformed base64; a bad packet just falls back to the
-	// armored path (kp empty) for this event.
-	var calKP []byte
-	if ev.CalendarKeyPacket != "" {
-		if raw, derr := base64.StdEncoding.DecodeString(ev.CalendarKeyPacket); derr == nil {
-			calKP = raw
-		}
+	sharedKP := decodeKeyPacket(ev.SharedKeyPacket)
+	calKP := decodeKeyPacket(ev.CalendarKeyPacket)
+	partSets := []struct {
+		parts []proton.CalendarEventPart
+		kp    []byte
+	}{
+		{ev.SharedEvents, sharedKP},
+		{ev.PersonalEvents, calKP},
+		{ev.CalendarEvents, calKP},
 	}
-	partSets := [][]proton.CalendarEventPart{ev.SharedEvents, ev.PersonalEvents, ev.CalendarEvents}
-	for _, parts := range partSets {
-		for _, part := range parts {
-			data, derr := decryptPart(part, calKR, addrKR, calKP)
+	decryptedAny := false
+	for _, set := range partSets {
+		for _, part := range set.parts {
+			data, derr := decryptPart(part, calKR, addrKR, set.kp)
 			if derr != nil {
 				err = derr
 				continue
 			}
+			decryptedAny = true
 			if summary == "" {
 				summary = icalProp(data, "SUMMARY")
 			}
@@ -269,15 +273,32 @@ func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing
 			if summary != "" && location != "" {
 				return summary, location, nil
 			}
-			// A part decrypted but carried neither field; keep looking,
-			// but this is no longer a failure.
-			err = nil
 		}
 	}
-	if err == nil && summary == "" && location == "" {
-		err = fmt.Errorf("no decryptable part with SUMMARY/LOCATION")
+	if !decryptedAny {
+		if err == nil {
+			err = fmt.Errorf("event has no parts to decrypt")
+		}
+		return summary, location, err
 	}
-	return summary, location, err
+	if summary == "" && location == "" {
+		return summary, location, fmt.Errorf("parts decrypted but no SUMMARY/LOCATION found")
+	}
+	return summary, location, nil
+}
+
+// decodeKeyPacket base64-decodes a key packet string; returns nil for an
+// empty or malformed packet instead of panicking (the library helper
+// panics on malformed base64).
+func decodeKeyPacket(packet string) []byte {
+	if packet == "" {
+		return nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(packet)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 // decryptPart replicates proton.CalendarEventPart.Decode but returns the
