@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	proton "github.com/ProtonMail/go-proton-api"
@@ -165,8 +166,8 @@ func cmdEvents(ctx context.Context, args []string) error {
 
 		for _, member := range members {
 			for _, addr := range addrs {
-				if addr.Email == member.Email {
-					kr, err := unlockAddressKeyring(ctx, c, salted, addr.ID)
+				if strings.EqualFold(addr.Email, member.Email) {
+					kr, err := unlockAddressKeyringForAddrs(salted, addr.ID, user, addrs)
 					if err != nil {
 						continue
 					}
