@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -148,11 +149,16 @@ func cmdMailList(ctx context.Context, args []string) error {
 func cmdMailRead(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mail read", flag.ContinueOnError)
 	decrypt := fs.Bool("decrypt", false, "decrypt the body (reads account password from stdin)")
+	downloadAtt := fs.Bool("download-attachments", false, "download attachments (decrypted) into a directory; requires --decrypt")
+	attDir := fs.String("attachments-dir", "", "directory for downloaded attachments (default: <message-id>-attachments)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: proton-cli mail read [--decrypt] <message-id>")
+		return fmt.Errorf("usage: proton-cli mail read [--decrypt] [--download-attachments] [--attachments-dir DIR] <message-id>")
+	}
+	if *downloadAtt && !*decrypt {
+		return fmt.Errorf("--download-attachments requires --decrypt")
 	}
 	id := fs.Arg(0)
 
@@ -172,6 +178,14 @@ func cmdMailRead(ctx context.Context, args []string) error {
 		"summary": summarize(msg.MessageMetadata),
 		"headers": msg.ParsedHeaders,
 	}
+
+	// Attachment metadata is not encrypted, so it is listed even
+	// without --decrypt; downloading fills in each entry's path.
+	atts := make([]attachmentInfo, 0, len(msg.Attachments))
+	for _, att := range msg.Attachments {
+		atts = append(atts, summarizeAttachment(att))
+	}
+	out["attachments"] = atts
 
 	if *decrypt {
 		pw, err := readSecretLine("Enter account password (via stdin):")
@@ -216,6 +230,16 @@ func cmdMailRead(ctx context.Context, args []string) error {
 			return fmt.Errorf("decrypt body: %w", err)
 		}
 		out["body"] = string(body)
+
+		if *downloadAtt {
+			dir := *attDir
+			if dir == "" {
+				dir = id + "-attachments"
+			}
+			if err := downloadAttachments(ctx, c, kr, msg, dir, atts); err != nil {
+				return err
+			}
+		}
 	} else {
 		out["body"] = nil
 		out["body_hint"] = "re-run with --decrypt to read the encrypted body"
@@ -231,6 +255,8 @@ func cmdMailSend(ctx context.Context, args []string) error {
 	subject := fs.String("subject", "", "subject (required)")
 	bodyFile := fs.String("body-file", "", "path to file with the message body (plain text)")
 	fromAddr := fs.String("from", "", "sender address (defaults to first usable address)")
+	var attachFiles stringList
+	fs.Var(&attachFiles, "attach", "file to attach (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -346,6 +372,24 @@ func cmdMailSend(ctx context.Context, args []string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("create draft: %w", err)
+	}
+
+	for _, path := range attachFiles {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			discardDraft(ctx, c, draft.ID)
+			return fmt.Errorf("read attachment %s: %w", path, err)
+		}
+		if _, err := c.UploadAttachment(ctx, kr, proton.CreateAttachmentReq{
+			MessageID:   draft.ID,
+			Filename:    filepath.Base(path),
+			MIMEType:    rfc822.MIMEType(attachmentMIMEType(path)),
+			Disposition: proton.AttachmentDisposition,
+			Body:        data,
+		}); err != nil {
+			discardDraft(ctx, c, draft.ID)
+			return fmt.Errorf("upload attachment %s: %w", path, err)
+		}
 	}
 
 	var req proton.SendDraftReq
