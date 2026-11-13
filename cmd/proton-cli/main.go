@@ -11,9 +11,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"os"
+	"time"
 )
 
 func main() {
@@ -80,13 +80,6 @@ Commands:
 Secrets are only read from stdin, never from argv or the environment.
 Run 'proton-cli <command> -h' for command flags.
 `)
-}
-
-func newFlagSet(name string, args []string) *flag.FlagSet {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	_ = fs.Parse(args)
-	return fs
 }
 
 // emitJSON writes v as indented JSON to stdout.
