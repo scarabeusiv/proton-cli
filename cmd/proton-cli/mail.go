@@ -74,8 +74,12 @@ func cmdMailList(ctx context.Context, args []string) error {
 	unreadOnly := fs.Bool("unread", false, "only unread messages")
 	subject := fs.String("subject", "", "filter: subject contains (case-insensitive, client-side)")
 	from := fs.String("from", "", "filter: sender contains (case-insensitive, client-side)")
-	limit := fs.Int("limit", 25, "max messages to return")
+	limitFlag := fs.Int("limit", 25, "max messages to return (0 = no limit)")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	limit, err := validateLimit(*limitFlag)
+	if err != nil {
 		return err
 	}
 
@@ -96,7 +100,7 @@ func cmdMailList(ctx context.Context, args []string) error {
 		return fmt.Errorf("list messages: %w", err)
 	}
 
-	out := make([]mailSummary, 0, *limit)
+	out := make([]mailSummary, 0, limit)
 	for _, mm := range metas {
 		if *unreadOnly && !bool(mm.Unread) {
 			continue
@@ -114,7 +118,7 @@ func cmdMailList(ctx context.Context, args []string) error {
 			}
 		}
 		out = append(out, summarize(mm))
-		if len(out) >= *limit {
+		if limit > 0 && len(out) >= limit {
 			break
 		}
 	}

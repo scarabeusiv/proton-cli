@@ -82,6 +82,15 @@ Run 'proton-cli <command> -h' for command flags.
 `)
 }
 
+// validateLimit checks a --limit flag value: negative limits are rejected
+// (a negative cap would panic in make), 0 means "no limit".
+func validateLimit(limit int) (int, error) {
+	if limit < 0 {
+		return 0, fmt.Errorf("--limit must be >= 0 (0 = no limit), got %d", limit)
+	}
+	return limit, nil
+}
+
 // emitJSON writes v as indented JSON to stdout.
 func emitJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
