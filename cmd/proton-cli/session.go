@@ -89,7 +89,7 @@ func authedClient(ctx context.Context) (*proton.Client, *proton.Manager, error) 
 		return nil, nil, err
 	}
 
-	m := proton.New()
+	m := newManager()
 
 	c, auth, err := m.NewClientWithRefresh(ctx, s.UID, s.RefreshToken)
 	if err != nil {
