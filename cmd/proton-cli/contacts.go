@@ -10,8 +10,12 @@ import (
 func cmdContacts(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("contacts", flag.ContinueOnError)
 	query := fs.String("query", "", "filter: name or email contains (case-insensitive, client-side)")
-	limit := fs.Int("limit", 50, "max contacts to return")
+	limitFlag := fs.Int("limit", 50, "max contacts to return (0 = no limit)")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	limit, err := validateLimit(*limitFlag)
+	if err != nil {
 		return err
 	}
 
@@ -27,7 +31,7 @@ func cmdContacts(ctx context.Context, args []string) error {
 		return fmt.Errorf("list contacts: %w", err)
 	}
 
-	out := make([]map[string]any, 0, *limit)
+	out := make([]map[string]any, 0, limit)
 	for _, ct := range contacts {
 		if *query != "" {
 			hay := strings.ToLower(ct.Name)
@@ -53,7 +57,7 @@ func cmdContacts(ctx context.Context, args []string) error {
 			"emails": emails,
 		})
 
-		if len(out) >= *limit {
+		if limit > 0 && len(out) >= limit {
 			break
 		}
 	}
