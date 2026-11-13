@@ -193,14 +193,21 @@ func unlockAddressKeyring(ctx context.Context, c *proton.Client, keyPass []byte,
 		return nil, fmt.Errorf("get user: %w", err)
 	}
 
-	userKR, err := user.Keys.Unlock(keyPass, nil)
-	if err != nil {
-		return nil, fmt.Errorf("unlock user keys (wrong mailbox password?): %w", err)
-	}
-
 	addrs, err := c.GetAddresses(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get addresses: %w", err)
+	}
+
+	return unlockAddressKeyringForAddrs(keyPass, addressID, user, addrs)
+}
+
+// unlockAddressKeyringForAddrs unlocks the address keyring for addressID
+// from an already-fetched user and address list, so callers that hold
+// them (e.g. the calendar member loop) do not re-fetch them per attempt.
+func unlockAddressKeyringForAddrs(keyPass []byte, addressID string, user proton.User, addrs []proton.Address) (*crypto.KeyRing, error) {
+	userKR, err := user.Keys.Unlock(keyPass, nil)
+	if err != nil {
+		return nil, fmt.Errorf("unlock user keys (wrong mailbox password?): %w", err)
 	}
 
 	for _, addr := range addrs {
