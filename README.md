@@ -34,8 +34,9 @@ the session, because a refreshed token cannot fetch them later.
 - `mail` — list / read / send mail
 - `calendars` — list Proton calendars
 - `events` — list calendar events in a date range; `--decrypt` decrypts
-  titles and locations (account password via stdin, asked before the
-  fetch so a wrong password fails fast)
+  titles and locations (account password via stdin, asked only when the
+  range has events, and before the bulk of the fetch so a wrong password
+  fails fast)
 - `contacts` — list / search contacts
 - `keys` — diagnostic: key IDs/flags and stored key-salt IDs (no secrets)
 - `event-raw` — diagnostic: one event's part structure (no decrypt)
