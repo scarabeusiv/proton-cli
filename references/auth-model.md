@@ -5,7 +5,7 @@ Proton authenticates with username + password via SRP (Secure Remote Password),
 plus optional TOTP 2FA. `credentials.request_api_access` only supports `api_key`
 and `oauth2_code` schemes — a password scheme is declined by name. There is no
 scoped token: any integration holds full account credentials. This is accepted
-by Tom (2026-09-19); handling must be airtight.
+by the maintainer (2026-09-19); handling must be airtight.
 
 ## What is stored
 `~/.config/proton-cli/session.json` (mode 0600, outside the git repo):
@@ -52,7 +52,7 @@ only needed at login time.
 ## Upgrading the library
 The repo pins `github.com/ProtonMail/go-proton-api` in `go.mod`. To upgrade:
 ```bash
-cd ~/workspace/skills/proton
+cd <repo-root>
 go get github.com/ProtonMail/go-proton-api@latest  # or @<commit>
 go mod tidy && go build -o bin/proton-cli ./cmd/proton-cli
 git add go.mod go.sum && git commit -m "bump go-proton-api"
