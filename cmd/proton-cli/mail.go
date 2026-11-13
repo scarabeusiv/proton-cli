@@ -192,7 +192,7 @@ func cmdMailSend(ctx context.Context, args []string) error {
 	cc := fs.String("cc", "", "cc addresses, comma-separated")
 	subject := fs.String("subject", "", "subject (required)")
 	bodyFile := fs.String("body-file", "", "path to file with the message body (plain text)")
-	fromAddr := fs.String("from", "", "sender address (defaults to first address)")
+	fromAddr := fs.String("from", "", "sender address (defaults to first usable address)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -206,6 +206,20 @@ func cmdMailSend(ctx context.Context, args []string) error {
 	body, err := os.ReadFile(*bodyFile)
 	if err != nil {
 		return fmt.Errorf("read body file: %w", err)
+	}
+
+	// Parse recipients before touching the server or the password: a bad
+	// or empty address list must fail before any draft exists.
+	toAddrs, err := parseAddrList(*to)
+	if err != nil {
+		return err
+	}
+	if len(toAddrs) == 0 {
+		return fmt.Errorf("--to must contain at least one recipient address")
+	}
+	ccAddrs, err := parseAddrList(*cc)
+	if err != nil {
+		return err
 	}
 
 	mbpw, err := readSecretLine("Enter mailbox password (via stdin) — needed to encrypt the draft:")
@@ -229,7 +243,7 @@ func cmdMailSend(ctx context.Context, args []string) error {
 		return fmt.Errorf("no sending addresses on this account")
 	}
 
-	sender := addrs[0]
+	sender := defaultSender(addrs)
 	if *fromAddr != "" {
 		found := false
 		for _, a := range addrs {
@@ -249,11 +263,10 @@ func cmdMailSend(ctx context.Context, args []string) error {
 		return err
 	}
 
-	toAddrs, err := parseAddrList(*to)
-	if err != nil {
-		return err
-	}
-	ccAddrs, err := parseAddrList(*cc)
+	// Build send preferences (recipient key lookups) BEFORE creating the
+	// draft, so a lookup failure leaves no orphaned draft behind.
+	allRecipients := append(append([]*gomail.Address{}, toAddrs...), ccAddrs...)
+	prefs, err := buildSendPrefs(ctx, c, allRecipients)
 	if err != nil {
 		return err
 	}
@@ -271,15 +284,42 @@ func cmdMailSend(ctx context.Context, args []string) error {
 		return fmt.Errorf("create draft: %w", err)
 	}
 
-	// Build send packages: encrypted for recipients we have keys for,
-	// cleartext otherwise.
-	allRecipients := append(append([]*gomail.Address{}, toAddrs...), ccAddrs...)
-	prefs := make(map[string]proton.SendPreferences, len(allRecipients))
+	var req proton.SendDraftReq
+	if err := req.AddTextPackage(kr, string(body), rfc822.TextPlain, prefs, nil); err != nil {
+		discardDraft(ctx, c, draft.ID)
+		return fmt.Errorf("build send package: %w", err)
+	}
 
-	for _, rcpt := range allRecipients {
+	sent, err := c.SendDraft(ctx, draft.ID, req)
+	if err != nil {
+		discardDraft(ctx, c, draft.ID)
+		return fmt.Errorf("send draft %s: %w", draft.ID, err)
+	}
+
+	return emitJSON(map[string]string{"status": "sent", "id": sent.ID})
+}
+
+// defaultSender picks the sending address: the first address that can
+// send (Send flag set, status enabled), falling back to the first
+// address when none qualifies.
+func defaultSender(addrs []proton.Address) proton.Address {
+	for _, a := range addrs {
+		if bool(a.Send) && a.Status == proton.AddressStatusEnabled {
+			return a
+		}
+	}
+	return addrs[0]
+}
+
+// buildSendPrefs resolves per-recipient send preferences: encrypted for
+// recipients we have keys for, cleartext otherwise.
+func buildSendPrefs(ctx context.Context, c *proton.Client, recipients []*gomail.Address) (map[string]proton.SendPreferences, error) {
+	prefs := make(map[string]proton.SendPreferences, len(recipients))
+
+	for _, rcpt := range recipients {
 		keys, rt, err := c.GetPublicKeys(ctx, rcpt.Address)
 		if err != nil {
-			return fmt.Errorf("get public keys for %s: %w", rcpt.Address, err)
+			return nil, fmt.Errorf("get public keys for %s: %w", rcpt.Address, err)
 		}
 
 		sp := proton.SendPreferences{
@@ -290,7 +330,7 @@ func cmdMailSend(ctx context.Context, args []string) error {
 		if rt == proton.RecipientTypeInternal && len(keys) > 0 {
 			kr, err := keys.GetKeyRing()
 			if err != nil {
-				return fmt.Errorf("keyring for %s: %w", rcpt.Address, err)
+				return nil, fmt.Errorf("keyring for %s: %w", rcpt.Address, err)
 			}
 			sp.Encrypt = true
 			sp.PubKey = kr
@@ -298,7 +338,7 @@ func cmdMailSend(ctx context.Context, args []string) error {
 		} else if len(keys) > 0 {
 			kr, err := keys.GetKeyRing()
 			if err != nil {
-				return fmt.Errorf("keyring for %s: %w", rcpt.Address, err)
+				return nil, fmt.Errorf("keyring for %s: %w", rcpt.Address, err)
 			}
 			sp.Encrypt = true
 			sp.PubKey = kr
@@ -311,17 +351,15 @@ func cmdMailSend(ctx context.Context, args []string) error {
 		prefs[rcpt.Address] = sp
 	}
 
-	var req proton.SendDraftReq
-	if err := req.AddTextPackage(kr, string(body), rfc822.TextPlain, prefs, nil); err != nil {
-		return fmt.Errorf("build send package: %w", err)
-	}
+	return prefs, nil
+}
 
-	sent, err := c.SendDraft(ctx, draft.ID, req)
-	if err != nil {
-		return fmt.Errorf("send draft %s: %w", draft.ID, err)
+// discardDraft deletes a draft left behind when sending fails, warning
+// instead of failing when the delete itself fails.
+func discardDraft(ctx context.Context, c *proton.Client, draftID string) {
+	if err := c.DeleteMessage(ctx, draftID); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not delete orphaned draft %s: %v\n", draftID, err)
 	}
-
-	return emitJSON(map[string]string{"status": "sent", "id": sent.ID})
 }
 
 func parseAddrList(s string) ([]*gomail.Address, error) {
