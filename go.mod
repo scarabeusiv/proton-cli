@@ -1,4 +1,4 @@
-module hatch.local/proton-cli
+module github.com/scarabeusiv/proton-cli
 
 go 1.27
 
