@@ -22,9 +22,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -37,6 +40,7 @@ import (
 	"testing"
 	"time"
 
+	proton "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
 )
 
@@ -271,20 +275,55 @@ type mockAPI struct {
 
 	// refreshErr makes POST /auth/v4/refresh fail.
 	refreshErr bool
+	// refreshFailFirst makes the first POST /auth/v4/refresh fail with
+	// 10013 (a stale token); later refreshes use the normal path.
+	refreshFailFirst bool
+	// onRefresh, when set, runs on every POST /auth/v4/refresh before
+	// the response is written. Tests use it to simulate another
+	// process rotating (and saving) the session mid-refresh.
+	onRefresh func()
 	// calendarsErr makes GET /calendar/v1 fail.
 	calendarsErr bool
 	// eventsFullPages makes the events endpoint return a full page
 	// (100 events) on every page, so listCalendarEvents hits its cap.
 	eventsFullPages bool
+	// rotatingRefresh makes POST /auth/v4/refresh enforce single-use
+	// refresh tokens (a presented token other than the current one
+	// fails with 10013) and makes the calendar/user endpoints reject
+	// a stale access token with 401, mimicking Proton's rotation.
+	rotatingRefresh bool
 
 	calendars []map[string]any
 	events    []map[string]any // paged by 100, in order
 	user      map[string]any
+	addresses []map[string]any
 	messages  []map[string]any
+	// currentRefresh/currentAccess are the tokens the rotating mock
+	// currently accepts. Tests seed them and the session file alike.
+	currentRefresh string
+	currentAccess  string
+	refreshSeq     int
 
 	mu           sync.Mutex
 	eventQueries []url.Values // Begin/End seen on the events endpoint
 	refreshCalls int
+}
+
+// expireAccessToken makes the rotating mock reject the current access
+// token (as if it expired) while leaving the refresh token valid, so
+// the next API call triggers a lazy refresh.
+func (m *mockAPI) expireAccessToken() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.currentAccess = "access-expired"
+}
+
+// validAccess reports whether r carries the mock's current access
+// token. Only meaningful with rotatingRefresh.
+func (m *mockAPI) validAccess(r *http.Request) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return r.Header.Get("Authorization") == "Bearer "+m.currentAccess
 }
 
 func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -293,14 +332,52 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/auth/v4/refresh":
 		m.mu.Lock()
 		m.refreshCalls++
+		calls := m.refreshCalls
 		m.mu.Unlock()
+		if m.onRefresh != nil {
+			m.onRefresh()
+		}
 		if m.refreshErr {
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprint(w, `{"Code":10013,"Error":"invalid refresh token"}`)
 			return
 		}
-		fmt.Fprint(w, `{"Code":1000,"Auth":{"UID":"test-uid","AccessToken":"test-access","RefreshToken":"test-refresh-new"}}`)
+		if m.refreshFailFirst && calls == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"Code":10013,"Error":"invalid refresh token"}`)
+			return
+		}
+		if m.rotatingRefresh {
+			var req struct {
+				RefreshToken string
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			m.mu.Lock()
+			if req.RefreshToken != m.currentRefresh {
+				m.mu.Unlock()
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, `{"Code":10013,"Error":"invalid refresh token"}`)
+				return
+			}
+			m.refreshSeq++
+			m.currentRefresh = fmt.Sprintf("refresh-%d", m.refreshSeq)
+			m.currentAccess = fmt.Sprintf("access-%d", m.refreshSeq)
+			acc, ref := m.currentAccess, m.currentRefresh
+			m.mu.Unlock()
+			// Top-level tokens: the library's refresh response is
+			// `struct { Auth }` with promoted fields, so it reads
+			// AccessToken/RefreshToken at the top level, not nested
+			// under "Auth".
+			fmt.Fprintf(w, `{"Code":1000,"UID":"test-uid","AccessToken":%q,"RefreshToken":%q}`, acc, ref)
+			return
+		}
+		fmt.Fprint(w, `{"Code":1000,"UID":"test-uid","AccessToken":"test-access","RefreshToken":"test-refresh-new"}`)
 	case r.Method == http.MethodGet && r.URL.Path == "/calendar/v1":
+		if m.rotatingRefresh && !m.validAccess(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"Code":10012,"Error":"invalid access token"}`)
+			return
+		}
 		if m.calendarsErr {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprint(w, `{"Code":2000,"Error":"calendar list failed"}`)
@@ -308,6 +385,11 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"Code": 1000, "Calendars": m.calendars})
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/calendar/v1/") && strings.HasSuffix(r.URL.Path, "/events"):
+		if m.rotatingRefresh && !m.validAccess(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"Code":10012,"Error":"invalid access token"}`)
+			return
+		}
 		m.mu.Lock()
 		m.eventQueries = append(m.eventQueries, r.URL.Query())
 		m.mu.Unlock()
@@ -340,7 +422,19 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"Code": 1000, "Events": out})
 	case r.Method == http.MethodGet && r.URL.Path == "/core/v4/users":
+		if m.rotatingRefresh && !m.validAccess(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"Code":10012,"Error":"invalid access token"}`)
+			return
+		}
 		writeJSON(w, map[string]any{"Code": 1000, "User": m.user})
+	case r.Method == http.MethodGet && r.URL.Path == "/core/v4/addresses":
+		if m.rotatingRefresh && !m.validAccess(r) {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"Code":10012,"Error":"invalid access token"}`)
+			return
+		}
+		writeJSON(w, map[string]any{"Code": 1000, "Addresses": m.addresses})
 	case r.Method == http.MethodPost && r.URL.Path == "/mail/v4/messages":
 		// Serves both the count request (Limit 0) and the page
 		// request: the count reader only looks at Total, the page
@@ -359,6 +453,21 @@ func writeJSON(w http.ResponseWriter, v any) {
 		return
 	}
 	w.Write(b)
+}
+
+// newMockAPIServer starts an httptest server backed by m and points the
+// CLI at it (via the apiHostURL override), without writing a session.
+// Tests that manage the session file themselves (rotating-token tests,
+// the CLI-level daemon test) use this; the rest use newMockAPI.
+func newMockAPIServer(t *testing.T, m *mockAPI) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(m)
+	t.Cleanup(srv.Close)
+
+	old := apiHostURL
+	apiHostURL = srv.URL
+	t.Cleanup(func() { apiHostURL = old })
+	return srv
 }
 
 // newMockAPI starts an httptest server backed by m and points the CLI at
@@ -683,23 +792,19 @@ func testEncryptedMockEvent(t *testing.T, kr *crypto.KeyRing, id string, start, 
 // of the mock events succeed without any real Proton credentials.
 func testDaemonWithMockAPI(t *testing.T, kr *crypto.KeyRing) *daemon {
 	t.Helper()
-	c, mgr, err := authedClient(context.Background())
+	c, mgr, auth, err := authedClientDirect(context.Background())
 	if err != nil {
-		t.Fatalf("authedClient: %v", err)
+		t.Fatalf("authedClientDirect: %v", err)
 	}
 	t.Cleanup(func() {
 		c.Close()
 		mgr.Close()
 	})
-	return &daemon{
-		calKR:         map[string]*crypto.KeyRing{"cal1": kr},
-		client:        c,
-		mgr:           mgr,
-		icsPort:       8765,
-		icsPastDays:   30,
-		icsFutureDays: 365,
-		done:          make(chan struct{}),
-	}
+	// Build via newDaemon so the daemon tracks the tokens the
+	// access_token op hands out (a struct literal leaves them empty).
+	d := newDaemon(c, mgr, auth, kr, 8765, 30, 365)
+	d.calKR["cal1"] = kr
+	return d
 }
 
 func TestIntegrationDaemonICSFeed(t *testing.T) {
@@ -845,5 +950,252 @@ func TestIntegrationEventsDecryptFallbackPrompts(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no input on stdin") {
 		t.Errorf("cmdEvents --decrypt fallback error = %v, want it to mention no input on stdin", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Daemon-owns-token and backgrounding tests
+// ---------------------------------------------------------------------------
+
+// runCLIEnv runs the test binary like runCLI, but with a caller-chosen
+// HOME/XDG_CONFIG_HOME shared across calls (so a daemon started by one
+// call is visible to the next), extra environment, and stdin input. It
+// fails the test if the command does not finish within 15s — a daemon
+// start that blocks in the foreground must fail loudly here, not hang
+// the suite.
+func runCLIEnv(t *testing.T, home, cfg, stdin string, extraEnv []string, args ...string) (stdout, stderr string, exitCode int) {
+	t.Helper()
+	bin := getTestBinary(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"XDG_CONFIG_HOME="+cfg,
+	)
+	cmd.Env = append(cmd.Env, extraEnv...)
+	cmd.Stdin = strings.NewReader(stdin)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	if err == nil {
+		exitCode = 0
+	} else if ee, ok := err.(*exec.ExitError); ok {
+		exitCode = ee.ExitCode()
+	} else {
+		t.Fatalf("runCLIEnv %v: %v", args, err)
+	}
+	return outBuf.String(), errBuf.String(), exitCode
+}
+
+// writeSessionFile writes s as the session file under cfgDir
+// (<cfgDir>/proton-cli/session.json, 0600), as a child process with
+// XDG_CONFIG_HOME=cfgDir would read it.
+func writeSessionFile(t *testing.T, cfgDir string, s session) {
+	t.Helper()
+	dir := filepath.Join(cfgDir, "proton-cli")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal session: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "session.json"), b, 0o600); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+}
+
+// freePort returns a free localhost TCP port for a test daemon's ICS feed.
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("freePort listen: %v", err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// testDaemonCredentials builds a fake user/address key pair for the
+// CLI-level daemon test: PGP keys locked with the salted password
+// derived from the test account password ("test-password"), the
+// matching salts, and the session + mock user/address maps that serve
+// them. The caller writes the session file and serves the maps.
+func testDaemonCredentials(t *testing.T) (sess session, user, address map[string]any) {
+	t.Helper()
+	const password = "test-password"
+	const userKeyID = "user-key-1"
+	const addrKeyID = "addr-key-1"
+
+	userKey, err := crypto.GenerateKey("Test", "test@example.com", "ed25519", 0)
+	if err != nil {
+		t.Fatalf("GenerateKey user: %v", err)
+	}
+	addrKey, err := crypto.GenerateKey("Test", "test@example.com", "ed25519", 0)
+	if err != nil {
+		t.Fatalf("GenerateKey address: %v", err)
+	}
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		t.Fatalf("rand salt: %v", err)
+	}
+	salts := proton.Salts{{ID: userKeyID, KeySalt: base64.StdEncoding.EncodeToString(salt)}}
+	salted, err := salts.SaltForKey([]byte(password), userKeyID)
+	if err != nil {
+		t.Fatalf("SaltForKey: %v", err)
+	}
+	if len(salted) == 0 {
+		t.Fatalf("SaltForKey returned empty")
+	}
+	lockedUser, err := userKey.Lock(salted)
+	if err != nil {
+		t.Fatalf("Lock user key: %v", err)
+	}
+	armoredUser, err := lockedUser.Armor()
+	if err != nil {
+		t.Fatalf("Armor user key: %v", err)
+	}
+	lockedAddr, err := addrKey.Lock(salted)
+	if err != nil {
+		t.Fatalf("Lock address key: %v", err)
+	}
+	armoredAddr, err := lockedAddr.Armor()
+	if err != nil {
+		t.Fatalf("Armor address key: %v", err)
+	}
+	zero(salted)
+	sess = session{UID: "test-uid", RefreshToken: "test-refresh", Salts: salts}
+	user = map[string]any{
+		"ID": "u1", "Name": "Tester", "DisplayName": "Tester", "Email": "test@example.com",
+		// Active must be 1: the library's Keys.Unlock only tries
+		// active keys, and an omitted field unmarshals to false.
+		"Keys": []map[string]any{{"ID": userKeyID, "Primary": 1, "Active": 1, "PrivateKey": armoredUser}},
+	}
+	address = map[string]any{
+		"ID": "addr1", "Email": "test@example.com",
+		"Keys": []map[string]any{{"ID": addrKeyID, "Primary": 1, "Active": 1, "PrivateKey": armoredAddr}},
+	}
+	return sess, user, address
+}
+
+// TestAuthedClientDirectRetryAfterRotation covers the no-daemon
+// fallback: a refresh that fails with 10013 because another process
+// rotated (and saved) between the load and the refresh is retried
+// once with the re-read token.
+func TestAuthedClientDirectRetryAfterRotation(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	m := &mockAPI{t: t, refreshFailFirst: true}
+	m.onRefresh = func() {
+		// Simulate the other process's rotation landing: the
+		// session file now holds a token the mock accepts.
+		p, err := sessionPath()
+		if err != nil {
+			return
+		}
+		b, _ := json.Marshal(session{UID: "test-uid", RefreshToken: "test-refresh-rotated"})
+		_ = os.WriteFile(p, b, 0o600)
+	}
+	newMockAPIServer(t, m)
+	if err := saveSession(session{UID: "test-uid", RefreshToken: "test-refresh-stale"}); err != nil {
+		t.Fatalf("saveSession: %v", err)
+	}
+	c, mgr, _, err := authedClientDirect(context.Background())
+	if err != nil {
+		t.Fatalf("authedClientDirect: %v", err)
+	}
+	defer c.Close()
+	defer mgr.Close()
+	s, err := loadSession()
+	if err != nil {
+		t.Fatalf("loadSession: %v", err)
+	}
+	if s.RefreshToken != "test-refresh-new" {
+		t.Errorf("session refresh token = %q, want test-refresh-new", s.RefreshToken)
+	}
+}
+
+// TestCLIDaemonStartBackgrounds is the end-to-end test for the
+// backgrounding daemon: the real binary prompts for the account
+// password, backgrounds itself, and answers status/calendars/stop.
+// It runs against the rotating mock (via PROTON_CLI_API_HOST) with a
+// hermetic config dir, never the live session.
+//
+// Skipped where os.UserConfigDir ignores XDG_CONFIG_HOME (macOS):
+// there the child binary would read the real config dir.
+func TestCLIDaemonStartBackgrounds(t *testing.T) {
+	cfg := t.TempDir()
+	home := t.TempDir()
+	probe := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", probe)
+	if dir, err := os.UserConfigDir(); err != nil || !strings.HasPrefix(dir, probe) {
+		t.Skip("os.UserConfigDir ignores XDG_CONFIG_HOME on this platform")
+	}
+
+	sess, user, address := testDaemonCredentials(t)
+	m := &mockAPI{t: t, rotatingRefresh: true, currentRefresh: "test-refresh", currentAccess: "test-access",
+		calendars: testCalendars(), user: user, addresses: []map[string]any{address}}
+	srv := newMockAPIServer(t, m)
+	env := []string{"PROTON_CLI_API_HOST=" + srv.URL}
+	writeSessionFile(t, cfg, sess)
+
+	port := freePort(t)
+	// Stop the daemon on the way out even if the test fails.
+	t.Cleanup(func() {
+		_, _, _ = runCLIEnv(t, home, cfg, "", env, "daemon", "stop")
+	})
+
+	_, stderr, code := runCLIEnv(t, home, cfg, "test-password\n", env, "daemon", "start", "--ics-port", strconv.Itoa(port))
+	if code != 0 {
+		t.Fatalf("daemon start: exit %d, stderr %q", code, stderr)
+	}
+	if !strings.Contains(stderr, "daemon started") || !strings.Contains(stderr, "PID") || !strings.Contains(stderr, "Log:") {
+		t.Errorf("daemon start stderr = %q, want PID/socket/ICS/log lines", stderr)
+	}
+	logPath := filepath.Join(cfg, "proton-cli", "daemon.log")
+	if b, err := os.ReadFile(logPath); err != nil {
+		t.Errorf("daemon log missing: %v", err)
+	} else if !strings.Contains(string(b), "daemon started") {
+		t.Errorf("daemon log = %q, want a startup line", b)
+	}
+
+	out, _, code := runCLIEnv(t, home, cfg, "", env, "daemon", "status")
+	if code != 0 {
+		t.Fatalf("daemon status: exit %d", code)
+	}
+	var status map[string]any
+	if err := json.Unmarshal([]byte(out), &status); err != nil {
+		t.Fatalf("daemon status is not JSON: %v (%q)", err, out)
+	}
+	if status["running"] != true {
+		t.Errorf("daemon status = %v, want running=true", status)
+	}
+
+	// A command goes through the daemon for its access token. The
+	// rotating mock rejects any other token, so success proves the
+	// daemon-token path.
+	out, _, code = runCLIEnv(t, home, cfg, "", env, "calendars")
+	if code != 0 {
+		t.Fatalf("calendars via daemon: exit %d", code)
+	}
+	if !strings.Contains(out, "Test Cal") {
+		t.Errorf("calendars via daemon = %q, want the mock calendar", out)
+	}
+
+	_, _, code = runCLIEnv(t, home, cfg, "", env, "daemon", "stop")
+	if code != 0 {
+		t.Fatalf("daemon stop: exit %d", code)
+	}
+	out, _, code = runCLIEnv(t, home, cfg, "", env, "daemon", "status")
+	if code != 0 {
+		t.Fatalf("daemon status after stop: exit %d", code)
+	}
+	if err := json.Unmarshal([]byte(out), &status); err != nil {
+		t.Fatalf("daemon status after stop is not JSON: %v", err)
+	}
+	if status["running"] != false {
+		t.Errorf("daemon status after stop = %v, want running=false", status)
 	}
 }

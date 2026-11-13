@@ -142,7 +142,13 @@ func cmdEvents(ctx context.Context, args []string) error {
 	var calKR, addrKR *crypto.KeyRing
 	useDaemon := false
 	if *decrypt && !*noDaemon {
-		useDaemon, _ = pingDaemon()
+		// The first decrypt command starts the daemon (prompting
+		// once) when stdin is a terminal; later commands reuse it.
+		// The client above was built before the daemon started, so
+		// it may hold a pre-daemon refresh token — but its access
+		// token is fresh (just issued), so it cannot expire during
+		// this short command.
+		useDaemon = ensureDaemonForDecrypt()
 	}
 
 	if *decrypt && !useDaemon {

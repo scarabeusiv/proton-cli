@@ -9,6 +9,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -396,5 +397,33 @@ func TestSaltForKey(t *testing.T) {
 	}
 	if len(out) != 0 {
 		t.Errorf("SaltForKey with empty KeySalt: got %d bytes, want 0", len(out))
+	}
+}
+
+// TestIsInvalidRefreshToken covers the 10013 detector the retry
+// paths rely on: a bare API error, a wrapped one (as produced by the
+// library's refresh chain), and a different code must not match.
+func TestIsInvalidRefreshToken(t *testing.T) {
+	invalid := &proton.APIError{Code: proton.AuthRefreshTokenInvalid}
+	if !isInvalidRefreshToken(invalid) {
+		t.Error("isInvalidRefreshToken(bare 10013) = false, want true")
+	}
+	// Wrapped as the library wraps it: the chain holds *APIError
+	// (catchAPIError returns &APIError, wrapped by resty), so the
+	// error is passed as an error interface, as the real chain does.
+	var asErr error = invalid
+	wrapped := fmt.Errorf("refresh: %w", asErr)
+	if !isInvalidRefreshToken(wrapped) {
+		t.Error("isInvalidRefreshToken(wrapped 10013) = false, want true")
+	}
+	other := &proton.APIError{Code: proton.PasswordWrong}
+	if isInvalidRefreshToken(other) {
+		t.Error("isInvalidRefreshToken(other code) = true, want false")
+	}
+	if isInvalidRefreshToken(errors.New("boom")) {
+		t.Error("isInvalidRefreshToken(plain error) = true, want false")
+	}
+	if isInvalidRefreshToken(nil) {
+		t.Error("isInvalidRefreshToken(nil) = true, want false")
 	}
 }

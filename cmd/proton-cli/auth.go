@@ -91,8 +91,14 @@ func cmdLogout(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// Stop a running daemon first: its held token is about to be
+	// revoked, and it would otherwise keep serving (and failing
+	// refreshes) with a dead session. Best effort: a missing daemon
+	// is not an error.
+	_ = stopDaemon()
+
 	// Best effort: revoke server-side before dropping local state.
-	if c, m, err := authedClient(ctx); err == nil {
+	if c, m, _, err := authedClientDirect(ctx); err == nil {
 		_ = c.AuthDelete(ctx)
 		c.Close()
 		m.Close()
