@@ -60,21 +60,25 @@ type eventSummary struct {
 
 // listCalendarEvents pages through the calendar API at a page size the
 // server accepts. The library's GetAllCalendarEvents uses PageSize=150,
-// which the calendar endpoint rejects (400 Code 2021).
+// which the calendar endpoint rejects (400 Code 2021). The page count is
+// capped: a server returning full pages forever would otherwise loop
+// forever and grow memory without bound. Failing closed (instead of
+// silently truncating) keeps a truncated list from passing as complete.
 func listCalendarEvents(ctx context.Context, c *proton.Client, calendarID string, filter url.Values) ([]proton.CalendarEvent, error) {
 	const pageSize = 100
+	const maxPages = 100
 	var all []proton.CalendarEvent
-	for page := 0; ; page++ {
+	for page := 0; page < maxPages; page++ {
 		evs, err := c.GetCalendarEvents(ctx, calendarID, page, pageSize, filter)
 		if err != nil {
 			return nil, err
 		}
 		all = append(all, evs...)
 		if len(evs) < pageSize {
-			break
+			return all, nil
 		}
 	}
-	return all, nil
+	return nil, fmt.Errorf("calendar event list exceeded %d pages of %d events; refusing to fetch more", maxPages, pageSize)
 }
 
 func cmdEvents(ctx context.Context, args []string) error {
