@@ -113,7 +113,10 @@ func cmdStatus(ctx context.Context, args []string) error {
 
 	s, err := loadSession()
 	if err != nil {
-		return emitJSON(map[string]string{"status": "no_session"})
+		if errors.Is(err, errNoSession) {
+			return emitJSON(map[string]string{"status": "no_session"})
+		}
+		return emitJSON(map[string]any{"status": "session_corrupt", "error": err.Error()})
 	}
 
 	c, m, err := authedClient(ctx)
