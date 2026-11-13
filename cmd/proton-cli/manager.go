@@ -13,7 +13,18 @@ import (
 // refresh it if Proton starts rejecting it (AppVersionBadCode 5003).
 const protonAppVersion = "web-mail@5.0.141.8"
 
+// apiHostURL overrides the default Proton API host when non-empty.
+// Integration tests set it to an httptest server URL so the commands
+// can be exercised end to end without real credentials or network
+// access to Proton. Production code never sets it, so real runs always
+// use the default host.
+var apiHostURL string
+
 // newManager builds a Proton API manager identifying as above.
 func newManager() *proton.Manager {
-	return proton.New(proton.WithAppVersion(protonAppVersion))
+	opts := []proton.Option{proton.WithAppVersion(protonAppVersion)}
+	if apiHostURL != "" {
+		opts = append(opts, proton.WithHostURL(apiHostURL))
+	}
+	return proton.New(opts...)
 }

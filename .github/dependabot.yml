@@ -1,0 +1,17 @@
+# Dependabot keeps dependencies current automatically: Go modules and
+# the GitHub Actions used by CI are both updated on a weekly schedule.
+# Review and merge the Dependabot PRs as they arrive; there is no
+# separate manual bump process.
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
