@@ -32,16 +32,18 @@ the session, because a refreshed token cannot fetch them later.
 
 - `login` / `logout` / `status` — authenticate, revoke, check the session
 - `mail` — list / read / send mail
-  - `mail read [--decrypt] <message-id>` — attachment metadata is always listed; `--download-attachments` writes the attachments decrypted into `<message-id>-attachments` (or `--attachments-dir DIR`); requires `--decrypt`. `--decrypt` uses the daemon when it is running (no password prompt); `--no-daemon` forces the prompt
+  - `mail read [--decrypt] <message-id>` — attachment metadata is always listed; `--download-attachments` writes the attachments decrypted into `<message-id>-attachments` (or `--attachments-dir DIR`); requires `--decrypt`. `--decrypt` uses the daemon when it is running (no password prompt); the first decrypt command starts the daemon when stdin is a terminal, so later commands reuse it; `--no-daemon` forces the prompt
   - `mail send --to ... --subject ... --body-file ... [--attach FILE]...` — attach files (repeatable)
   - `mail mark-read | mark-unread | delete <message-id>...` — triage, several IDs per call
   - `mail labels` — list labels; `mail label <id>... --add <label-id> [--remove <label-id>]`; `mail create-label --name <name> [--color <hex>]`
 - `calendars` — list Proton calendars
 - `events` — list calendar events in a date range; `--decrypt` decrypts
   titles and locations (uses the daemon when it is running, so no
-  password prompt; otherwise the account password is read from stdin,
-  asked only when the range has events, and before the bulk of the fetch
-  so a wrong password fails fast; `--no-daemon` forces the prompt)
+  password prompt; the first decrypt command starts the daemon when
+  stdin is a terminal, so later commands reuse it; otherwise the
+  account password is read from stdin, asked only when the range has
+  events, and before the bulk of the fetch so a wrong password fails
+  fast; `--no-daemon` forces the prompt)
 - `contacts` — list / search contacts
 - `keys` — diagnostic: key IDs/flags and stored key-salt IDs (no secrets)
 - `event-raw` — diagnostic: one event's part structure (no decrypt)
@@ -60,9 +62,19 @@ debugging. It listens on a Unix socket at
 `~/.config/proton-cli/daemon.sock` (0600, same-user only) for decrypt
 requests, and serves a read-only ICS feed over HTTP on localhost. When
 it exits (`daemon stop`, logout, reboot) the keyrings are gone and it
-must be started again. If the daemon is not running, decrypt commands
-fall back to prompting for the account password, exactly as before;
-`--no-daemon` forces that prompt path.
+must be started again.
+
+The daemon is the single owner of the auth token: it is the only
+process that refreshes the refresh token, and every command gets its
+access token from the daemon while it is running — so concurrent CLI
+invocations cannot race each other's refreshes. (With no daemon
+running, commands refresh directly from the session file; concurrent
+runs in that mode can still collide on a rotation, and a failed
+refresh is retried once after re-reading the file.) The first decrypt
+command starts the daemon when stdin is a terminal, so the keyring
+stays in memory across commands instead of prompting every time; with
+piped stdin, decrypt commands keep prompting per command. `logout`
+stops a running daemon before revoking the session.
 
 ```sh
 proton-cli daemon start [--ics-port 8765] [--ics-days-past 30] [--ics-days-future 365] [--foreground]
@@ -96,10 +108,12 @@ on all interfaces.
   API. Event titles/locations are end-to-end encrypted: `--decrypt`
   unlocks them with your account password. The Bridge IMAP password is
   a different thing and will not unlock the keys.
-- Never run two proton-cli processes concurrently: they share one
-  session file and Proton rotates refresh tokens, so each process's
-  refresh invalidates the others' access tokens. Run exports
-  sequentially.
+- With a daemon running, concurrent proton-cli invocations are safe:
+  they all get their access token from the daemon, the single
+  refresher. With no daemon running, run commands sequentially:
+  concurrent direct refreshes can collide on a rotation (a failed
+  refresh is retried once after re-reading the session file, but a
+  second collision still forces a re-run).
 - `events` passes Begin/End to the server and additionally filters the
   results locally, so it only ever returns events overlapping the
   requested date range.

@@ -107,27 +107,94 @@ func clearSession() error {
 	return nil
 }
 
+// isInvalidRefreshToken reports whether err (or anything it wraps)
+// is a Proton invalid-refresh-token error (Code 10013). The library
+// surfaces API errors as *proton.APIError through the resty
+// ResponseError chain, so errors.As finds it through the wrapping.
+func isInvalidRefreshToken(err error) bool {
+	var apiErr *proton.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == proton.AuthRefreshTokenInvalid
+	}
+	return false
+}
+
+// newClientWithRefreshRetry builds a client from s via
+// NewClientWithRefresh (which refreshes eagerly). On an
+// invalid-refresh-token failure it re-reads the session file once and
+// retries with the fresh token, so a rotation by another process that
+// landed between the load and the refresh does not force a re-login.
+// It returns the session the successful attempt used (for its salts).
+func newClientWithRefreshRetry(ctx context.Context, m *proton.Manager, s session) (*proton.Client, proton.Auth, session, error) {
+	c, auth, err := m.NewClientWithRefresh(ctx, s.UID, s.RefreshToken)
+	if err == nil || !isInvalidRefreshToken(err) {
+		return c, auth, s, err
+	}
+	fresh, err2 := loadSession()
+	if err2 != nil || fresh.RefreshToken == s.RefreshToken {
+		// Nothing newer to retry with; the original error stands.
+		return nil, proton.Auth{}, s, err
+	}
+	c, auth, err = m.NewClientWithRefresh(ctx, fresh.UID, fresh.RefreshToken)
+	return c, auth, fresh, err
+}
+
 // authedClient builds a client from the stored session, refreshing the access
 // token as needed, and persists rotated refresh tokens.
+//
+// When a daemon is running it is the single owner of the auth token:
+// the client is built from the daemon's current access token and
+// cannot refresh on its own (the daemon refreshes). When no daemon
+// answers, the session file is used directly — that path is safe
+// because no daemon exists to race with.
 func authedClient(ctx context.Context) (*proton.Client, *proton.Manager, error) {
+	if running, _ := pingDaemon(); running {
+		return authedClientViaDaemon(ctx)
+	}
+	c, m, _, err := authedClientDirect(ctx)
+	return c, m, err
+}
+
+// authedClientViaDaemon builds a client from the access token the
+// daemon hands out. The client carries no refresh token, so it cannot
+// refresh on its own: if the access token expires mid-command the
+// daemon is the only refresher, and a re-run fetches a fresh token
+// (the daemon probes/refreshes on every access_token op).
+func authedClientViaDaemon(ctx context.Context) (*proton.Client, *proton.Manager, error) {
+	tok, err := daemonAccessToken()
+	if err != nil {
+		return nil, nil, fmt.Errorf("daemon could not provide an access token — restart the daemon (`proton-cli daemon start`) or run `proton-cli login` again: %w", err)
+	}
+	m := newManager()
+	c := m.NewClient(tok.UID, tok.AccessToken, "")
+	return c, m, nil
+}
+
+// authedClientDirect builds a client directly from the session file,
+// refreshing the access token as needed, and persists rotated refresh
+// tokens. Callers that ARE the daemon (daemon start) use this
+// explicitly; ordinary commands go through authedClient, which prefers
+// the daemon when one is running. It also returns the auth the client
+// was built with, so the daemon can track its tokens.
+func authedClientDirect(ctx context.Context) (*proton.Client, *proton.Manager, proton.Auth, error) {
 	s, err := loadSession()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, proton.Auth{}, err
 	}
 
 	m := newManager()
 
-	c, auth, err := m.NewClientWithRefresh(ctx, s.UID, s.RefreshToken)
+	c, auth, used, err := newClientWithRefreshRetry(ctx, m, s)
 	if err != nil {
 		m.Close()
-		return nil, nil, fmt.Errorf("session refresh failed — run `proton-cli login` again: %w", err)
+		return nil, nil, proton.Auth{}, fmt.Errorf("session refresh failed — run `proton-cli login` again: %w", err)
 	}
 
-	if auth.RefreshToken != "" && auth.RefreshToken != s.RefreshToken {
-		_ = saveSession(session{UID: auth.UID, RefreshToken: auth.RefreshToken, Salts: s.Salts})
+	if auth.RefreshToken != "" && auth.RefreshToken != used.RefreshToken {
+		_ = saveSession(session{UID: auth.UID, RefreshToken: auth.RefreshToken, Salts: used.Salts})
 	}
 
-	return c, m, nil
+	return c, m, auth, nil
 }
 
 // stdinReader is the single buffered reader for stdin. Secret reads share

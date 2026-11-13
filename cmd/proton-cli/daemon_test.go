@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"net"
 	"os"
@@ -318,5 +319,160 @@ func TestDaemonUnknownOp(t *testing.T) {
 	}
 	if !strings.Contains(resp.Error, "unknown op") {
 		t.Errorf("daemon unknown op error = %q, want it to mention unknown op", resp.Error)
+	}
+}
+
+// --- daemon-owns-token ops ---
+
+// rotatingDaemon starts a test daemon whose client was built against
+// the rotating mock (single-use refresh tokens, Bearer-checked
+// endpoints), so the tests below can exercise the 10013 recovery
+// paths. The mock's current tokens are test-refresh / test-access;
+// the session file is seeded with the same refresh token.
+func rotatingDaemon(t *testing.T) (*mockAPI, *daemon) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	m := &mockAPI{t: t, rotatingRefresh: true, currentRefresh: "test-refresh", currentAccess: "test-access"}
+	newMockAPIServer(t, m)
+	if err := saveSession(session{UID: "test-uid", RefreshToken: "test-refresh"}); err != nil {
+		t.Fatalf("saveSession: %v", err)
+	}
+	c, mgr, auth, err := authedClientDirect(context.Background())
+	if err != nil {
+		t.Fatalf("authedClientDirect: %v", err)
+	}
+	// The eager refresh rotated test-refresh -> refresh-1 /
+	// access-1; the daemon is the only owner of that client now.
+	return m, newDaemon(c, mgr, auth, testKeyRing(t), 8765, 30, 365)
+}
+
+// TestDaemonAccessTokenOp covers the daemon-owns-token path: the op
+// hands out the daemon's current access token, and an expired access
+// token triggers a lazy refresh (via the probe) so the op still
+// returns a fresh token — and the rotation is persisted.
+func TestDaemonAccessTokenOp(t *testing.T) {
+	m, d := rotatingDaemon(t)
+	startTestDaemon(t, d)
+
+	tok, err := daemonAccessToken()
+	if err != nil {
+		t.Fatalf("daemonAccessToken: %v", err)
+	}
+	if tok.UID != "test-uid" || tok.AccessToken != "access-1" {
+		t.Errorf("daemonAccessToken = %+v, want UID test-uid / access-1", tok)
+	}
+
+	// Expire just the access token: the next op must refresh lazily
+	// (refresh token still valid) and hand out the fresh token.
+	m.expireAccessToken()
+	tok, err = daemonAccessToken()
+	if err != nil {
+		t.Fatalf("daemonAccessToken after expiry: %v", err)
+	}
+	if tok.AccessToken != "access-2" {
+		t.Errorf("daemonAccessToken after expiry = %q, want access-2", tok.AccessToken)
+	}
+	s, err := loadSession()
+	if err != nil {
+		t.Fatalf("loadSession after refresh: %v", err)
+	}
+	if s.RefreshToken != "refresh-2" {
+		t.Errorf("session refresh token = %q, want refresh-2", s.RefreshToken)
+	}
+}
+
+// TestDaemonAccessTokenOpRecoversFromStaleToken is the regression
+// test for the reported 503: another process rotated (and saved) the
+// refresh token after the daemon started, so the daemon's held
+// refresh token is consumed. The op must still hand out a fresh
+// token — the probe's lazy refresh fails with 10013, the daemon
+// rebuilds its client from the session file and retries.
+func TestDaemonAccessTokenOpRecoversFromStaleToken(t *testing.T) {
+	m, d := rotatingDaemon(t)
+	startTestDaemon(t, d)
+
+	// Another process rotates the token (as a CLI run does).
+	c2, mgr2, _, err := authedClientDirect(context.Background())
+	if err != nil {
+		t.Fatalf("rotating authedClientDirect: %v", err)
+	}
+	c2.Close()
+	mgr2.Close()
+
+	tok, err := daemonAccessToken()
+	if err != nil {
+		t.Fatalf("daemonAccessToken after rotation: %v", err)
+	}
+	m.mu.Lock()
+	want := m.currentAccess
+	m.mu.Unlock()
+	if tok.AccessToken != want {
+		t.Errorf("daemonAccessToken after rotation = %q, want the mock's current %q", tok.AccessToken, want)
+	}
+}
+
+// TestDaemonBuildICSFeedRecoversFromStaleToken is the same recovery
+// at the feed level: the 503 the daemon served was a feed build
+// failing on a stale refresh token. After a rotation by another
+// process, the feed must still build (empty VCALENDAR here — the
+// mock has no calendars).
+func TestDaemonBuildICSFeedRecoversFromStaleToken(t *testing.T) {
+	_, d := rotatingDaemon(t)
+
+	c2, mgr2, _, err := authedClientDirect(context.Background())
+	if err != nil {
+		t.Fatalf("rotating authedClientDirect: %v", err)
+	}
+	c2.Close()
+	mgr2.Close()
+
+	feed, err := d.buildICSFeedWithRetry(context.Background())
+	if err != nil {
+		t.Fatalf("buildICSFeedWithRetry after rotation: %v", err)
+	}
+	if !strings.HasPrefix(feed, "BEGIN:VCALENDAR\r\n") || !strings.HasSuffix(feed, "END:VCALENDAR\r\n") {
+		t.Errorf("buildICSFeedWithRetry = %q, want an empty VCALENDAR", feed)
+	}
+}
+
+// TestStdinIsTTY pins the /dev/null regression: in `go test` stdin
+// is /dev/null, which IS a character device — a ModeCharDevice check
+// alone returned true for it, so decrypt commands tried to start a
+// daemon (and, in the test binary, re-exec'd the suite as
+// `daemon start`, recursing until the suite timed out).
+func TestStdinIsTTY(t *testing.T) {
+	if stdinIsTTY() {
+		t.Error("stdinIsTTY with test stdin = true, want false")
+	}
+}
+
+func TestIsTestBinary(t *testing.T) {
+	if !isTestBinary("/tmp/go-build123/b001/proton-cli.test") {
+		t.Error("isTestBinary(test binary) = false, want true")
+	}
+	if isTestBinary("/Users/fluff/bin/proton-cli") {
+		t.Error("isTestBinary(real binary) = true, want false")
+	}
+}
+
+// TestEnsureDaemonForDecrypt covers the on-demand start: with a
+// daemon answering it is used; with none and non-TTY stdin (as in
+// `go test`) it does not spawn one, and the caller falls back to
+// prompting.
+func TestEnsureDaemonForDecrypt(t *testing.T) {
+	dir := t.TempDir()
+	old := daemonSocketPathOverride
+	daemonSocketPathOverride = filepath.Join(dir, "no-such.sock")
+	t.Cleanup(func() { daemonSocketPathOverride = old })
+
+	if ensureDaemonForDecrypt() {
+		t.Fatal("ensureDaemonForDecrypt with no daemon and piped stdin: got true, want false")
+	}
+
+	d := &daemon{addrKR: testKeyRing(t), calKR: make(map[string]*crypto.KeyRing), icsPort: 8765}
+	startTestDaemon(t, d)
+	if !ensureDaemonForDecrypt() {
+		t.Fatal("ensureDaemonForDecrypt with a running daemon: got false, want true")
 	}
 }

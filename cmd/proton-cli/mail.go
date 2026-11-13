@@ -191,11 +191,16 @@ func cmdMailRead(ctx context.Context, args []string) error {
 
 	if *decrypt {
 		// The daemon holds the unlocked keyring in memory; when it
-		// answers, decrypt through it and never prompt. Otherwise
-		// fall back to the local prompt path, exactly as before.
+		// answers, decrypt through it and never prompt. The first
+		// decrypt command starts the daemon (prompting once) when
+		// stdin is a terminal; otherwise fall back to the local
+		// prompt path, exactly as before. (The client above was
+		// built before the daemon started, so it may hold a
+		// pre-daemon refresh token — but its access token is fresh,
+		// just issued, so it cannot expire during this command.)
 		useDaemon := false
 		if !*noDaemon {
-			useDaemon, _ = pingDaemon()
+			useDaemon = ensureDaemonForDecrypt()
 		}
 
 		var kr *crypto.KeyRing

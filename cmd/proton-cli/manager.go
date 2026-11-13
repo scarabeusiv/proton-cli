@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+
 	"github.com/ProtonMail/go-proton-api"
 )
 
@@ -23,8 +25,15 @@ var apiHostURL string
 // newManager builds a Proton API manager identifying as above.
 func newManager() *proton.Manager {
 	opts := []proton.Option{proton.WithAppVersion(protonAppVersion)}
-	if apiHostURL != "" {
-		opts = append(opts, proton.WithHostURL(apiHostURL))
+	host := apiHostURL
+	if host == "" {
+		// Test/debug override: point the CLI at a local mock API
+		// (used by the CLI-level daemon tests, which run the real
+		// binary as a subprocess). Never set in production.
+		host = os.Getenv("PROTON_CLI_API_HOST")
+	}
+	if host != "" {
+		opts = append(opts, proton.WithHostURL(host))
 	}
 	return proton.New(opts...)
 }
