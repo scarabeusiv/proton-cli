@@ -25,7 +25,8 @@ proton-cli events --calendar ID [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--decrypt
 proton-cli contacts [--query X] [--limit N]
 ```
 
-All output is JSON on stdout; errors go to stderr. Label IDs: 0 = inbox, 1 = all mail, 5 = sent (see `proton-cli mail list --label 1` to discover more via message LabelIDs).
+Most commands emit JSON on stdout; errors go to stderr. The `keys` and
+`event-raw` diagnostics print plain text instead of JSON. Label IDs: 0 = inbox, 1 = all mail, 5 = sent (see `proton-cli mail list --label 1` to discover more via message LabelIDs).
 
 ## Auth
 No connector exists for Proton (username+password SRP login is not a supported connector scheme). Auth state is a session UID + refresh token at `~/.config/proton-cli/session.json` (mode 0600), created by `proton-cli login`. The password is never stored — only the refreshable session. See `references/auth-model.md` for the full credential model.
@@ -38,4 +39,4 @@ First-time setup needs the user's Proton password (and TOTP code if 2FA is on) s
 3. Calendar is read-only in this integration: list calendars and fetch events only. Do not attempt event create/update/delete — the library has no such endpoints.
 4. `mail read` without `--decrypt` returns metadata + headers only; bodies need the mailbox password (usually the login password), asked for transiently each time.
 5. If a command reports `session_invalid`, run `login` again — do not retry blindly.
-6. Mailbox password failures ("wrong mailbox password?") mean the login password differs from the mailbox password — ask Tom; do not guess.
+6. Mailbox password failures ("wrong mailbox password?") mean unlocking the keys failed — not necessarily that the login and mailbox passwords differ. The salted key password is derived from the mailbox password with the salts stored in the session, so a session without salts, or a call that passes the raw password where the salted one is required, fails the same way. Check the salts and the unlock path before asking Tom about differing passwords.
