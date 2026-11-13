@@ -25,7 +25,7 @@ func cmdLogin(ctx context.Context, args []string) error {
 	}
 	defer zero(password)
 
-	m := proton.New()
+	m := newManager()
 	defer m.Close()
 
 	c, auth, err := m.NewClientWithLogin(ctx, *username, password)
