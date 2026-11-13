@@ -2,6 +2,11 @@
 # the GitHub Actions used by CI are both updated on a weekly schedule.
 # Review and merge the Dependabot PRs as they arrive; there is no
 # separate manual bump process.
+#
+# go-proton-api is excluded: it has no tagged release newer than v0.4.0,
+# and v0.4.0 predates the commit we pin, so a Dependabot bump would be a
+# downgrade that does not even compile. It is tracked by the monthly
+# update workflow (.github/workflows/update-proton-api.yml) instead.
 version: 2
 updates:
   - package-ecosystem: "gomod"
@@ -9,6 +14,8 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    ignore:
+      - dependency-name: "github.com/ProtonMail/go-proton-api"
 
   - package-ecosystem: "github-actions"
     directory: "/"

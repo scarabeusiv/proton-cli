@@ -1,0 +1,64 @@
+name: Update go-proton-api
+
+# go-proton-api has no tagged release newer than v0.4.0, and v0.4.0
+# predates the commit we pin, so Dependabot cannot track it (it only
+# proposes tagged releases). This workflow bumps the pinned commit to
+# the latest on go-proton-api master once a month, and opens a PR only
+# if the full gate passes. Dependabot ignores go-proton-api
+# (see .github/dependabot.yml), so this is the only update path.
+on:
+  schedule:
+    - cron: "0 0 1 * *" # monthly, 1st at 00:00 UTC
+  workflow_dispatch: # allow a manual run
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    name: Bump go-proton-api to latest master
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27"
+          cache: true
+
+      - name: Bump go-proton-api to latest master
+        run: |
+          go get github.com/ProtonMail/go-proton-api@master
+          go mod tidy
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Format check
+        run: test -z "$(gofmt -l .)"
+
+      - name: Lint (staticcheck)
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+      - name: Test (race detector)
+        run: go test -race -count=1 ./...
+
+      - name: Open PR
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: update-go-proton-api
+          delete-branch: true
+          title: "build(deps): bump go-proton-api to latest master"
+          body: |
+            Automated monthly bump of go-proton-api to the latest commit on its
+            master branch (Dependabot cannot track it: no tagged release newer
+            than v0.4.0 exists, and v0.4.0 predates the pinned commit).
+
+            The full gate (build, vet, gofmt, staticcheck, `go test -race`)
+            passed on this commit.
