@@ -109,12 +109,9 @@ func cmdEvents(ctx context.Context, args []string) error {
 		"End":   []string{strconv.FormatInt(toT.Unix(), 10)},
 	}
 
-	events, err := listCalendarEvents(ctx, c, *calendarID, filter)
-	if err != nil {
-		return fmt.Errorf("list events: %w", err)
-	}
-
-	// Optional: set up calendar decryption so titles resolve.
+	// Optional: set up calendar decryption so titles resolve. This runs
+	// BEFORE fetching events, so a bad password fails fast instead of
+	// after the (slow) multi-page fetch.
 	var calKR, addrKR *crypto.KeyRing
 
 	if *decrypt {
@@ -123,6 +120,24 @@ func cmdEvents(ctx context.Context, args []string) error {
 			return err
 		}
 		defer zero(mbpw)
+
+		// Private keys are encrypted with a salted key password derived
+		// from the mailbox password (bcrypt with the key salt), not with
+		// the raw mailbox password. This is the step Bridge performs;
+		// passing the raw password fails with a key checksum error.
+		salts, err := c.GetSalts(ctx)
+		if err != nil {
+			return fmt.Errorf("get key salts: %w", err)
+		}
+		user, err := c.GetUser(ctx)
+		if err != nil {
+			return fmt.Errorf("get user: %w", err)
+		}
+		salted, err := salts.SaltForKey(mbpw, user.Keys.Primary().ID)
+		if err != nil {
+			return fmt.Errorf("derive salted key password: %w", err)
+		}
+		defer zero(salted)
 
 		// Use the member's address keyring to unlock the calendar passphrase.
 		members, err := c.GetCalendarMembers(ctx, *calendarID)
@@ -140,7 +155,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 		for _, member := range members {
 			for _, addr := range addrs {
 				if addr.Email == member.Email {
-					kr, err := unlockAddressKeyring(ctx, c, mbpw, addr.ID)
+					kr, err := unlockAddressKeyring(ctx, c, salted, addr.ID)
 					if err != nil {
 						continue
 					}
@@ -177,6 +192,11 @@ func cmdEvents(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("unlock calendar keys: %w", err)
 		}
+	}
+
+	events, err := listCalendarEvents(ctx, c, *calendarID, filter)
+	if err != nil {
+		return fmt.Errorf("list events: %w", err)
 	}
 
 	out := make([]eventSummary, 0, len(events))
