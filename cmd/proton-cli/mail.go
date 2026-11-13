@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	proton "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gluon/rfc822"
+	proton "github.com/ProtonMail/go-proton-api"
 	gomail "net/mail"
 )
 
@@ -326,8 +326,11 @@ func parseAddrList(s string) ([]*gomail.Address, error) {
 		}
 		a, err := gomail.ParseAddress(p)
 		if err != nil {
-			// Fall back to treating it as a bare address.
-			if _, err2 := gomail.ParseAddress(p); err2 != nil {
+			// Fall back to treating it as a bare address, but only
+			// if it looks like one (local@domain, no spaces or
+			// delimiters). Re-parsing the same string would fail
+			// again deterministically, so the fallback could never run.
+			if !isBareAddress(p) {
 				return nil, fmt.Errorf("bad address %q: %w", p, err)
 			}
 			a = &gomail.Address{Address: p}
@@ -335,4 +338,17 @@ func parseAddrList(s string) ([]*gomail.Address, error) {
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// isBareAddress reports whether s looks like a plain local@domain address
+// with no display name, spaces, or delimiters.
+func isBareAddress(s string) bool {
+	if strings.Count(s, "@") != 1 {
+		return false
+	}
+	local, domain, _ := strings.Cut(s, "@")
+	if local == "" || domain == "" {
+		return false
+	}
+	return !strings.ContainsAny(s, " \t<>(),;:\"")
 }
