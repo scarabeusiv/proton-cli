@@ -136,9 +136,20 @@ func cmdEvents(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("get user: %w", err)
 		}
-		salted, err := stored.Salts.SaltForKey(mbpw, user.Keys.Primary().ID)
+		// Primary() panics when no key is flagged primary, so look the
+		// primary key up by hand first.
+		primaryID := primaryKeyID(user.Keys)
+		if primaryID == "" {
+			return fmt.Errorf("no primary user key — cannot derive salted key password")
+		}
+		salted, err := stored.Salts.SaltForKey(mbpw, primaryID)
 		if err != nil {
 			return fmt.Errorf("derive salted key password: %w", err)
+		}
+		// SaltForKey swallows MailboxPassword errors and returns
+		// (nil, nil); an empty result cannot unlock anything.
+		if len(salted) == 0 {
+			return fmt.Errorf("derive salted key password: empty result")
 		}
 		defer zero(salted)
 
@@ -195,12 +206,30 @@ func cmdEvents(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("unlock calendar keys: %w", err)
 		}
+		// Unlock silently skips keys that fail, so it can return an
+		// empty keyring with a nil error. Fail fast instead of
+		// surfacing later as "N/N events failed to decrypt".
+		if calKR.CountDecryptionEntities() == 0 {
+			return fmt.Errorf("unlock calendar keys: no calendar keys could be unlocked")
+		}
 	}
 
 	events, err := listCalendarEvents(ctx, c, *calendarID, filter)
 	if err != nil {
 		return fmt.Errorf("list events: %w", err)
 	}
+
+	// Begin/End are passed to the server, but the server may ignore
+	// them — filter locally too, so only events overlapping the
+	// requested range are ever returned.
+	fromUnix, toUnix := fromT.Unix(), toT.Unix()
+	inRange := make([]proton.CalendarEvent, 0, len(events))
+	for _, ev := range events {
+		if ev.StartTime < toUnix && ev.EndTime > fromUnix {
+			inRange = append(inRange, ev)
+		}
+	}
+	events = inRange
 
 	out := make([]eventSummary, 0, len(events))
 	decryptFailed := 0
@@ -258,11 +287,13 @@ func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing
 	decryptedAny := false
 	for _, set := range partSets {
 		for _, part := range set.parts {
-			data, derr := decryptPart(part, calKR, addrKR, set.kp)
-			if derr != nil {
+			// Decode decrypts in place (part.Data) and verifies the
+			// signature; it is the library method, not a local copy.
+			if derr := part.Decode(calKR, addrKR, set.kp); derr != nil {
 				err = derr
 				continue
 			}
+			data := part.Data
 			decryptedAny = true
 			if summary == "" {
 				summary = icalProp(data, "SUMMARY")
@@ -299,50 +330,6 @@ func decodeKeyPacket(packet string) []byte {
 		return nil
 	}
 	return raw
-}
-
-// decryptPart replicates proton.CalendarEventPart.Decode but returns the
-// decrypted string (the upstream method's assignment is lost in some
-// versions) and takes the event's calendar key packet, without which the
-// split-message parts cannot be decrypted.
-func decryptPart(part proton.CalendarEventPart, calKR, addrKR *crypto.KeyRing, kp []byte) (string, error) {
-	data := part.Data
-
-	if part.Type&proton.CalendarEventTypeEncrypted != 0 {
-		var enc *crypto.PGPMessage
-
-		if len(kp) > 0 {
-			raw, err := base64.StdEncoding.DecodeString(data)
-			if err != nil {
-				return "", fmt.Errorf("base64 decode: %w", err)
-			}
-			enc = crypto.NewPGPSplitMessage(kp, raw).GetPGPMessage()
-		} else {
-			var err error
-			if enc, err = crypto.NewPGPMessageFromArmored(data); err != nil {
-				return "", fmt.Errorf("parse armored: %w", err)
-			}
-		}
-
-		dec, err := calKR.Decrypt(enc, nil, crypto.GetUnixTime())
-		if err != nil {
-			return "", fmt.Errorf("decrypt: %w", err)
-		}
-
-		data = dec.GetString()
-	}
-
-	if part.Type&proton.CalendarEventTypeSigned != 0 {
-		sig, err := crypto.NewPGPSignatureFromArmored(part.Signature)
-		if err != nil {
-			return "", fmt.Errorf("parse sig: %w", err)
-		}
-		if err := addrKR.VerifyDetached(crypto.NewPlainMessageFromString(data), sig, crypto.GetUnixTime()); err != nil {
-			return "", fmt.Errorf("verify sig: %w", err)
-		}
-	}
-
-	return data, nil
 }
 
 // icalProp pulls the named property out of an iCal VEVENT payload,
