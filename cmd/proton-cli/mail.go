@@ -168,7 +168,33 @@ func cmdMailRead(ctx context.Context, args []string) error {
 		}
 		defer zero(mbpw)
 
-		kr, err := unlockAddressKeyring(ctx, c, mbpw, msg.AddressID)
+		// The key password is the SALTED password, not the raw mailbox
+		// password: derive it from the salts captured at login.
+		stored, err := loadSession()
+		if err != nil {
+			return err
+		}
+		if len(stored.Salts) == 0 {
+			return fmt.Errorf("no key salts stored in session — run `proton-cli login` again to capture them")
+		}
+		user, err := c.GetUser(ctx)
+		if err != nil {
+			return fmt.Errorf("get user: %w", err)
+		}
+		primaryID := primaryKeyID(user.Keys)
+		if primaryID == "" {
+			return fmt.Errorf("no primary user key — cannot derive salted key password")
+		}
+		salted, err := stored.Salts.SaltForKey(mbpw, primaryID)
+		if err != nil {
+			return fmt.Errorf("derive salted key password: %w", err)
+		}
+		if len(salted) == 0 {
+			return fmt.Errorf("derive salted key password: empty salted password")
+		}
+		defer zero(salted)
+
+		kr, err := unlockAddressKeyring(ctx, c, salted, msg.AddressID)
 		if err != nil {
 			return err
 		}
@@ -258,7 +284,33 @@ func cmdMailSend(ctx context.Context, args []string) error {
 		}
 	}
 
-	kr, err := unlockAddressKeyring(ctx, c, mbpw, sender.ID)
+	// The key password is the SALTED password, not the raw mailbox
+	// password: derive it from the salts captured at login.
+	stored, err := loadSession()
+	if err != nil {
+		return err
+	}
+	if len(stored.Salts) == 0 {
+		return fmt.Errorf("no key salts stored in session — run `proton-cli login` again to capture them")
+	}
+	user, err := c.GetUser(ctx)
+	if err != nil {
+		return fmt.Errorf("get user: %w", err)
+	}
+	primaryID := primaryKeyID(user.Keys)
+	if primaryID == "" {
+		return fmt.Errorf("no primary user key — cannot derive salted key password")
+	}
+	salted, err := stored.Salts.SaltForKey(mbpw, primaryID)
+	if err != nil {
+		return fmt.Errorf("derive salted key password: %w", err)
+	}
+	if len(salted) == 0 {
+		return fmt.Errorf("derive salted key password: empty salted password")
+	}
+	defer zero(salted)
+
+	kr, err := unlockAddressKeyring(ctx, c, salted, sender.ID)
 	if err != nil {
 		return err
 	}
