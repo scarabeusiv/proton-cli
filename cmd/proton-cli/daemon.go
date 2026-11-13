@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -60,6 +61,17 @@ func daemonSocketPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "proton-cli", "daemon.sock"), nil
+}
+
+// daemonLogPath returns the daemon's log file path, next to the socket
+// in the config directory. The backgrounded daemon writes its stdout
+// and stderr there; a foreground daemon writes to the terminal instead.
+func daemonLogPath() (string, error) {
+	sockPath, err := daemonSocketPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(sockPath), "daemon.log"), nil
 }
 
 // daemonRequest is one JSON request over the Unix socket (one request per
@@ -468,13 +480,19 @@ func cmdDaemon(ctx context.Context, args []string) error {
 }
 
 // cmdDaemonStart prompts once for the account password, unlocks the
-// address keyring, and serves decrypt requests until stopped. It runs in
-// the foreground; stop it with `proton-cli daemon stop` or Ctrl-C.
+// address keyring, and serves decrypt requests until stopped. By
+// default it backgrounds itself after the prompt: the parent returns
+// the terminal once the daemon answers its socket, and the daemon
+// keeps running detached (its output goes to daemon.log next to the
+// socket). --foreground keeps the old blocking behaviour, for
+// supervisors (systemd/launchd) and debugging.
 func cmdDaemonStart(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("daemon start", flag.ContinueOnError)
 	icsPort := fs.Int("ics-port", defaultICSPort, "port for the read-only ICS feed on 127.0.0.1")
 	icsPast := fs.Int("ics-days-past", defaultICSDaysPast, "days of past events in the ICS feed")
 	icsFuture := fs.Int("ics-days-future", defaultICSDaysFuture, "days of future events in the ICS feed")
+	foreground := fs.Bool("foreground", false, "stay in the foreground instead of backgrounding after the prompt")
+	daemonized := fs.Bool("daemonized", false, "internal: run as the backgrounded daemon child (do not use directly)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -483,6 +501,10 @@ func cmdDaemonStart(ctx context.Context, args []string) error {
 	}
 	if *icsPast < 0 || *icsFuture < 0 {
 		return fmt.Errorf("ICS window days must be >= 0, got --ics-days-past %d --ics-days-future %d", *icsPast, *icsFuture)
+	}
+
+	if *daemonized {
+		return cmdDaemonStartChild(ctx, *icsPort, *icsPast, *icsFuture)
 	}
 
 	sockPath, err := daemonSocketPath()
@@ -494,6 +516,8 @@ func cmdDaemonStart(ctx context.Context, args []string) error {
 			return fmt.Errorf("daemon is already running (socket %s)", sockPath)
 		}
 		// Stale socket: the previous daemon died without removing it.
+		// Removed before forking so the parent's readiness check
+		// below can only succeed on the new child's socket.
 		_ = os.Remove(sockPath)
 	}
 
@@ -547,12 +571,173 @@ func cmdDaemonStart(ctx context.Context, args []string) error {
 	}
 	defer zero(salted)
 
+	// Unlock here, in the foreground, so a wrong account password
+	// fails immediately with a clear error instead of leaving a
+	// backgrounded daemon that dies on startup.
 	addrKR, err := unlockAddressKeyring(ctx, c, salted, "")
 	if err != nil {
 		m.Close()
 		return err
 	}
 
+	if *foreground {
+		return runDaemon(c, m, addrKR, sockPath, *icsPort, *icsPast, *icsFuture)
+	}
+
+	logPath, err := daemonLogPath()
+	if err != nil {
+		c.Close()
+		m.Close()
+		return err
+	}
+	pid, err := spawnDaemonChild(salted, *icsPort, *icsPast, *icsFuture, logPath)
+	c.Close()
+	m.Close()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "daemon started (PID %d, socket %s)\nICS feed: http://127.0.0.1:%d/calendar.ics\nLog: %s\n", pid, sockPath, *icsPort, logPath)
+	return nil
+}
+
+// cmdDaemonStartChild runs as the backgrounded daemon: it reads the
+// salted key password from the anonymous pipe (fd 3) the parent
+// passed, unlocks the keyring, and serves. It never prompts: a missing
+// or empty pipe is a fatal startup error (logged to the daemon log).
+func cmdDaemonStartChild(ctx context.Context, icsPort, icsPast, icsFuture int) error {
+	pipe := os.NewFile(3, "daemon-pipe")
+	salted, err := io.ReadAll(pipe)
+	_ = pipe.Close()
+	if err != nil {
+		return fmt.Errorf("read key password from parent: %w", err)
+	}
+	if len(salted) == 0 {
+		return fmt.Errorf("no key password received from parent")
+	}
+	defer zero(salted)
+
+	c, m, err := authedClient(ctx)
+	if err != nil {
+		return err
+	}
+	c.AddAuthHandler(func(auth proton.Auth) {
+		if auth.RefreshToken == "" {
+			return
+		}
+		if s, err := loadSession(); err == nil && auth.RefreshToken != s.RefreshToken {
+			_ = saveSession(session{UID: auth.UID, RefreshToken: auth.RefreshToken, Salts: s.Salts})
+		}
+	})
+
+	addrKR, err := unlockAddressKeyring(ctx, c, salted, "")
+	if err != nil {
+		m.Close()
+		return err
+	}
+	// The salted password unlocked the keyring; it is not needed again.
+	zero(salted)
+
+	sockPath, err := daemonSocketPath()
+	if err != nil {
+		m.Close()
+		return err
+	}
+	return runDaemon(c, m, addrKR, sockPath, icsPort, icsPast, icsFuture)
+}
+
+// spawnDaemonChild re-execs this binary as a detached daemon child,
+// passing the salted key password over an anonymous pipe (fd 3) and
+// waiting until the child answers pings on the socket (up to ~10s).
+// It returns the child's PID.
+//
+// The salted password never touches disk, argv or the environment:
+// only the anonymous pipe carries it, and the child reads it once,
+// unlocks the keyring, and zeroes it. Same-user processes can already
+// talk to the daemon over its socket, so passing the already-derived
+// salted password (which unlocks keys but cannot log in to Proton)
+// over the pipe is within the accepted threat model.
+func spawnDaemonChild(salted []byte, icsPort, icsPast, icsFuture int, logPath string) (int, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return 0, err
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, fmt.Errorf("open daemon log %s: %w", logPath, err)
+	}
+	defer logFile.Close()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		return 0, err
+	}
+
+	cmd := exec.Command(exe, "daemon", "start", "--daemonized",
+		"--ics-port", strconv.Itoa(icsPort),
+		"--ics-days-past", strconv.Itoa(icsPast),
+		"--ics-days-future", strconv.Itoa(icsFuture))
+	cmd.ExtraFiles = []*os.File{r}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil // /dev/null: the child must not hold the terminal
+	// Detach from the controlling terminal/session so the daemon
+	// survives the terminal closing and never receives its signals.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	if err := cmd.Start(); err != nil {
+		_ = r.Close()
+		_ = w.Close()
+		return 0, fmt.Errorf("start daemon: %w", err)
+	}
+	// The child has its own copy of the read end now.
+	_ = r.Close()
+	if _, err := w.Write(salted); err != nil {
+		_ = w.Close()
+		return 0, fmt.Errorf("send key password to daemon: %w", err)
+	}
+	_ = w.Close()
+
+	// Wait for readiness: the child answers a ping only once it is
+	// listening and serving. Fail fast if the child exits first.
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	deadline := time.Now().Add(10 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if running, _ := pingDaemon(); running {
+			return cmd.Process.Pid, nil
+		}
+		select {
+		case err := <-waitCh:
+			return 0, fmt.Errorf("daemon exited during startup (%v); log tail:\n%s", err, logTail(logPath))
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				_ = cmd.Process.Kill()
+				return 0, fmt.Errorf("daemon did not answer within 10s; log tail:\n%s", logTail(logPath))
+			}
+		}
+	}
+}
+
+// logTail returns the last few lines of the daemon log, for startup
+// failure reports. A missing/unreadable log is not itself an error.
+func logTail(logPath string) string {
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		return "(no daemon log)"
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) > 20 {
+		lines = lines[len(lines)-20:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// runDaemon listens on the socket and serves decrypt requests plus the
+// ICS feed until stopped (a `daemon stop` request or SIGINT/SIGTERM).
+// It owns the client/manager and closes them on shutdown.
+func runDaemon(c *proton.Client, m *proton.Manager, addrKR *crypto.KeyRing, sockPath string, icsPort, icsPast, icsFuture int) error {
 	dir := filepath.Dir(sockPath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		m.Close()
@@ -580,9 +765,9 @@ func cmdDaemonStart(ctx context.Context, args []string) error {
 		calKR:         make(map[string]*crypto.KeyRing),
 		client:        c,
 		mgr:           m,
-		icsPort:       *icsPort,
-		icsPastDays:   *icsPast,
-		icsFutureDays: *icsFuture,
+		icsPort:       icsPort,
+		icsPastDays:   icsPast,
+		icsFutureDays: icsFuture,
 		listener:      ln,
 		done:          make(chan struct{}),
 	}

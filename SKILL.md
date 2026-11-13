@@ -28,7 +28,7 @@ proton-cli calendars
 proton-cli events --calendar ID [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--decrypt] [--no-daemon]
 proton-cli contacts [--query X] [--limit N]
 
-proton-cli daemon start [--ics-port 8765] [--ics-days-past 30] [--ics-days-future 365]  # unlock once, hold keyrings in memory
+proton-cli daemon start [--ics-port 8765] [--ics-days-past 30] [--ics-days-future 365] [--foreground]  # unlock once, hold keyrings in memory; backgrounds itself after prompting unless --foreground
 proton-cli daemon stop
 proton-cli daemon status
 proton-cli daemon ics   # print the ICS feed URL and Apple Calendar subscription steps

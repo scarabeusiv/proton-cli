@@ -53,7 +53,10 @@ the session, because a refreshed token cannot fetch them later.
 `proton-cli daemon start` prompts once for the account password, unlocks
 the keyrings, and holds them in memory (the Proton Bridge model), so
 `events --decrypt` and `mail read --decrypt` stop asking for the password
-on every run. It listens on a Unix socket at
+on every run. It backgrounds itself after the prompt and returns the
+terminal (its output goes to `daemon.log` next to the socket);
+`--foreground` keeps it in the foreground, for supervisors and
+debugging. It listens on a Unix socket at
 `~/.config/proton-cli/daemon.sock` (0600, same-user only) for decrypt
 requests, and serves a read-only ICS feed over HTTP on localhost. When
 it exits (`daemon stop`, logout, reboot) the keyrings are gone and it
@@ -62,7 +65,7 @@ fall back to prompting for the account password, exactly as before;
 `--no-daemon` forces that prompt path.
 
 ```sh
-proton-cli daemon start [--ics-port 8765] [--ics-days-past 30] [--ics-days-future 365]
+proton-cli daemon start [--ics-port 8765] [--ics-days-past 30] [--ics-days-future 365] [--foreground]
 proton-cli daemon stop
 proton-cli daemon status   # JSON: {"running": true, "ics_url": "..."}
 proton-cli daemon ics      # print the feed URL and subscription steps
