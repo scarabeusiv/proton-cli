@@ -3,7 +3,7 @@ module github.com/scarabeusiv/proton-cli
 go 1.27
 
 require (
-	github.com/ProtonMail/gluon v0.0.0-20260910132611-39e5c6ac84fe
+	github.com/ProtonMail/gluon v0.17.0
 	github.com/ProtonMail/go-proton-api v0.0.0-20260916131751-882710fb04bb
 	github.com/ProtonMail/gopenpgp/v2 v2.11.1
 )
