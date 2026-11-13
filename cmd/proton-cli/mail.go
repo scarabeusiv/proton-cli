@@ -15,7 +15,7 @@ import (
 
 func cmdMail(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: proton-cli mail <list|read|send> [flags]")
+		return fmt.Errorf("usage: proton-cli mail <list|read|send|mark-read|mark-unread|delete|labels|label|create-label> [flags]")
 	}
 
 	switch args[0] {
@@ -25,8 +25,20 @@ func cmdMail(ctx context.Context, args []string) error {
 		return cmdMailRead(ctx, args[1:])
 	case "send":
 		return cmdMailSend(ctx, args[1:])
+	case "mark-read":
+		return cmdMailMarkRead(ctx, args[1:])
+	case "mark-unread":
+		return cmdMailMarkUnread(ctx, args[1:])
+	case "delete":
+		return cmdMailDelete(ctx, args[1:])
+	case "labels":
+		return cmdMailLabels(ctx, args[1:])
+	case "label":
+		return cmdMailLabel(ctx, args[1:])
+	case "create-label":
+		return cmdMailCreateLabel(ctx, args[1:])
 	default:
-		return fmt.Errorf("unknown mail subcommand %q (list|read|send)", args[0])
+		return fmt.Errorf("unknown mail subcommand %q (list|read|send|mark-read|mark-unread|delete|labels|label|create-label)", args[0])
 	}
 }
 
