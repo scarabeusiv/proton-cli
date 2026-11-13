@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 
 	"github.com/ProtonMail/go-proton-api"
 )
@@ -30,7 +33,25 @@ func cmdLogin(ctx context.Context, args []string) error {
 
 	c, auth, err := m.NewClientWithLogin(ctx, *username, password)
 	if err != nil {
-		return fmt.Errorf("login failed: %w", err)
+		// Proton may demand human verification (CAPTCHA, Code 9001) on a
+		// first login from a new client. The error carries a verification
+		// token: the user solves it in the browser, then the login is
+		// retried with the token attached.
+		var apiErr *proton.APIError
+		if errors.As(err, &apiErr) && apiErr.IsHVError() {
+			if hv, hvErr := apiErr.GetHVDetails(); hvErr == nil {
+				fmt.Fprintln(os.Stderr, "Proton wants human verification (CAPTCHA). Solve it in your browser, then press Enter here to continue:")
+				fmt.Fprintf(os.Stderr, "https://verify.proton.me/?methods=%s&token=%s\n", strings.Join(hv.Methods, ","), url.QueryEscape(hv.Token))
+				if waitErr := waitForEnter(); waitErr == nil {
+					c, auth, err = m.NewClientWithLoginWithHVToken(ctx, *username, password, hv)
+				} else {
+					return fmt.Errorf("human verification not completed: %w", waitErr)
+				}
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("login failed: %w", err)
+		}
 	}
 	defer c.Close()
 

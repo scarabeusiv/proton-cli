@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -102,6 +103,20 @@ func authedClient(ctx context.Context) (*proton.Client, *proton.Manager, error) 
 	}
 
 	return c, m, nil
+}
+
+// waitForEnter waits for a single line on stdin (content ignored). Used to
+// pause while the user solves a CAPTCHA in the browser.
+func waitForEnter() error {
+	r := bufio.NewReader(os.Stdin)
+	line, err := r.ReadBytes('\n')
+	if err != nil && err != io.EOF {
+		return err
+	}
+	if len(line) == 0 && err == io.EOF {
+		return fmt.Errorf("no input on stdin — solve the CAPTCHA, then run login again")
+	}
+	return nil
 }
 
 // readSecretLine reads one line from stdin (for passwords / TOTP codes) and
