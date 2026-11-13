@@ -87,7 +87,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 	calendarID := fs.String("calendar", "", "calendar ID (required)")
 	from := fs.String("from", "", "start date YYYY-MM-DD (default: today)")
 	to := fs.String("to", "", "end date YYYY-MM-DD exclusive (default: from + 1 day)")
-	decrypt := fs.Bool("decrypt", false, "decrypt event titles (reads mailbox password from stdin)")
+	decrypt := fs.Bool("decrypt", false, "decrypt event titles (reads account password from stdin)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -122,11 +122,11 @@ func cmdEvents(ctx context.Context, args []string) error {
 	var calKR, addrKR *crypto.KeyRing
 
 	if *decrypt {
-		mbpw, err := readSecretLine("Enter mailbox password (via stdin):")
+		pw, err := readSecretLine("Enter account password (via stdin):")
 		if err != nil {
 			return err
 		}
-		defer zero(mbpw)
+		defer zero(pw)
 
 		// Key salts were captured at login time (a refreshed token cannot
 		// fetch them). If this session predates that, log in again.
@@ -147,7 +147,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 		if primaryID == "" {
 			return fmt.Errorf("no primary user key — cannot derive salted key password")
 		}
-		salted, err := stored.Salts.SaltForKey(mbpw, primaryID)
+		salted, err := stored.Salts.SaltForKey(pw, primaryID)
 		if err != nil {
 			return fmt.Errorf("derive salted key password: %w", err)
 		}
