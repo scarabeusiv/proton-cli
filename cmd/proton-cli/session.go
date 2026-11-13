@@ -17,6 +17,12 @@ import (
 type session struct {
 	UID          string `json:"uid"`
 	RefreshToken string `json:"refresh_token"`
+	// Key salts, captured at login time. /core/v4/keys/salts requires a
+	// short-lived post-login "password scope" that a refreshed token does
+	// not carry, so they cannot be fetched by a later run. Salts are
+	// per-key bcrypt salts; without the mailbox password they unlock
+	// nothing. Re-captured on every login.
+	Salts proton.Salts `json:"salts,omitempty"`
 }
 
 func sessionPath() (string, error) {
@@ -98,12 +104,8 @@ func authedClient(ctx context.Context) (*proton.Client, *proton.Manager, error) 
 		return nil, nil, fmt.Errorf("session refresh failed — run `proton-cli login` again: %w", err)
 	}
 
-	// Diagnostic: the access token's scope gates endpoints such as
-	// /core/v4/keys/salts (403 Code 9101 when insufficient). Not secret.
-	fmt.Fprintf(os.Stderr, "token scope: %s\n", auth.Scope)
-
 	if auth.RefreshToken != "" && auth.RefreshToken != s.RefreshToken {
-		_ = saveSession(session{UID: auth.UID, RefreshToken: auth.RefreshToken})
+		_ = saveSession(session{UID: auth.UID, RefreshToken: auth.RefreshToken, Salts: s.Salts})
 	}
 
 	return c, m, nil

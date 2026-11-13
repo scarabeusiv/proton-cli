@@ -67,7 +67,14 @@ func cmdLogin(ctx context.Context, args []string) error {
 		}
 	}
 
-	if err := saveSession(session{UID: auth.UID, RefreshToken: auth.RefreshToken}); err != nil {
+	// Capture key salts now, while this login token still carries the
+	// short-lived password scope: a refreshed token cannot fetch them.
+	salts, err := c.GetSalts(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not capture key salts (%v) — decrypt will need a fresh login\n", err)
+	}
+
+	if err := saveSession(session{UID: auth.UID, RefreshToken: auth.RefreshToken, Salts: salts}); err != nil {
 		return fmt.Errorf("save session: %w", err)
 	}
 

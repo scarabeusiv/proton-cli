@@ -121,19 +121,20 @@ func cmdEvents(ctx context.Context, args []string) error {
 		}
 		defer zero(mbpw)
 
-		// Private keys are encrypted with a salted key password derived
-		// from the mailbox password (bcrypt with the key salt), not with
-		// the raw mailbox password. This is the step Bridge performs;
-		// passing the raw password fails with a key checksum error.
-		salts, err := c.GetSalts(ctx)
+		// Key salts were captured at login time (a refreshed token cannot
+		// fetch them). If this session predates that, log in again.
+		stored, err := loadSession()
 		if err != nil {
-			return fmt.Errorf("get key salts: %w", err)
+			return err
+		}
+		if len(stored.Salts) == 0 {
+			return fmt.Errorf("no key salts stored in session — run `proton-cli login` again to capture them")
 		}
 		user, err := c.GetUser(ctx)
 		if err != nil {
 			return fmt.Errorf("get user: %w", err)
 		}
-		salted, err := salts.SaltForKey(mbpw, user.Keys.Primary().ID)
+		salted, err := stored.Salts.SaltForKey(mbpw, user.Keys.Primary().ID)
 		if err != nil {
 			return fmt.Errorf("derive salted key password: %w", err)
 		}
