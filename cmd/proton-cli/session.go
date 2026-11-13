@@ -111,11 +111,16 @@ func authedClient(ctx context.Context) (*proton.Client, *proton.Manager, error) 
 	return c, m, nil
 }
 
+// stdinReader is the single buffered reader for stdin. Secret reads share
+// it: a fresh bufio.Reader per read could buffer past the first newline and
+// discard the buffered bytes with the reader, breaking piped multi-line
+// input (e.g. password + TOTP piped to login).
+var stdinReader = bufio.NewReader(os.Stdin)
+
 // waitForEnter waits for a single line on stdin (content ignored). Used to
 // pause while the user solves a CAPTCHA in the browser.
 func waitForEnter() error {
-	r := bufio.NewReader(os.Stdin)
-	line, err := r.ReadBytes('\n')
+	line, err := stdinReader.ReadBytes('\n')
 	if err != nil && err != io.EOF {
 		return err
 	}
@@ -130,8 +135,7 @@ func waitForEnter() error {
 func readSecretLine(prompt string) ([]byte, error) {
 	fmt.Fprintln(os.Stderr, prompt)
 
-	r := bufio.NewReader(os.Stdin)
-	line, err := r.ReadBytes('\n')
+	line, err := stdinReader.ReadBytes('\n')
 	if err != nil {
 		// Accept EOF-terminated input too (e.g. printf without newline).
 		if len(line) == 0 {
