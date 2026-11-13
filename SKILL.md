@@ -17,8 +17,12 @@ proton-cli logout                             # revoke + delete local session
 proton-cli status                             # check session health
 
 proton-cli mail list [--label ID] [--unread] [--subject-substr X] [--from X] [--limit N]
-proton-cli mail read [--decrypt] <message-id> # --decrypt reads account password from stdin
-proton-cli mail send --to a@b [--cc c@d] --subject S --body-file PATH [--from addr]
+proton-cli mail read [--decrypt] [--download-attachments [--attachments-dir DIR]] <message-id> # --decrypt reads account password from stdin
+proton-cli mail send --to a@b [--cc c@d] --subject S --body-file PATH [--from addr] [--attach FILE]...
+proton-cli mail mark-read|mark-unread|delete <message-id>...
+proton-cli mail labels
+proton-cli mail label <message-id>... --add <label-id> [--remove <label-id>]
+proton-cli mail create-label --name <name> [--color <hex>]
 
 proton-cli calendars
 proton-cli events --calendar ID [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--decrypt]
@@ -37,6 +41,6 @@ First-time setup needs the user's Proton password (and TOTP code if 2FA is on) s
 1. Secrets only ever travel via stdin pipes. Never put passwords, TOTP codes, or account passwords in argv, environment variables, files, chat messages, or logs.
 2. Never send email without showing the user the exact draft and receiving their approval first.
 3. Calendar is read-only in this integration: list calendars and fetch events only. Do not attempt event create/update/delete — the library has no such endpoints.
-4. `mail read` without `--decrypt` returns metadata + headers only; bodies need the account password (usually the login password), asked for transiently each time.
+4. `mail read` without `--decrypt` returns metadata + headers only; bodies need the account password (usually the login password), asked for transiently each time. Attachment metadata (name, size, MIME type) is listed without a password; `--download-attachments` writes the attachments decrypted into `<message-id>-attachments` (or `--attachments-dir DIR`) and needs `--decrypt`.
 5. If a command reports `session_invalid`, run `login` again — do not retry blindly.
 6. Account password failures ("wrong account password?") mean unlocking the keys failed. The salted key password is derived from the account password with the salts stored in the session, so a session without salts, or a call that passes the raw password where the salted one is required, fails the same way. Check the salts and the unlock path before asking the user to re-enter the password.

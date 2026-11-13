@@ -76,7 +76,7 @@ Commands:
   login      Authenticate (username flag; password via stdin, TOTP via stdin if 2FA)
   logout     Revoke the session and delete local auth state
   status     Show whether a session exists and if it still refreshes
-  mail       Mail operations: list | read | send
+  mail       Mail operations: list | read | send | mark-read | mark-unread | delete | labels | label | create-label
   calendars  List Proton calendars
   events     List calendar events in a date range (read-only)
   event-raw  Diagnostic: print one event's part structure (no decrypt, no password)
