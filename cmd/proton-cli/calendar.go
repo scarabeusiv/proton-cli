@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 
@@ -201,6 +203,8 @@ func cmdEvents(ctx context.Context, args []string) error {
 	}
 
 	out := make([]eventSummary, 0, len(events))
+	decryptFailed := 0
+	var firstDecryptErr error
 	for _, ev := range events {
 		s := eventSummary{
 			ID:        ev.ID,
@@ -213,35 +217,111 @@ func cmdEvents(ctx context.Context, args []string) error {
 		}
 
 		if *decrypt && calKR != nil {
-			s.Summary, s.Location = decryptEventDetails(&ev, calKR, addrKR)
+			var err error
+			s.Summary, s.Location, err = decryptEventDetails(&ev, calKR, addrKR)
+			if err != nil {
+				decryptFailed++
+				if firstDecryptErr == nil {
+					firstDecryptErr = err
+				}
+			}
 		}
 
 		out = append(out, s)
 	}
 
+	// A total decrypt failure must be visible, not silently empty.
+	if *decrypt && decryptFailed > 0 {
+		fmt.Fprintf(os.Stderr, "decrypt: %d/%d events failed to decrypt (first error: %v)\n", decryptFailed, len(events), firstDecryptErr)
+	}
+
 	return emitJSON(out)
 }
 
-// decryptEventDetails decodes the personal event part and extracts the
-// SUMMARY and LOCATION properties from the iCal payload. Best effort:
-// returns "" for anything missing or undecodable.
-func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing) (summary, location string) {
-	for i := range ev.PersonalEvents {
-		part := &ev.PersonalEvents[i]
-		if err := part.Decode(calKR, addrKR, nil); err != nil {
-			continue
-		}
-		if summary == "" {
-			summary = icalProp(part.Data, "SUMMARY")
-		}
-		if location == "" {
-			location = icalProp(part.Data, "LOCATION")
-		}
-		if summary != "" && location != "" {
-			break
+// decryptEventDetails extracts the SUMMARY and LOCATION properties from an
+// event's decrypted iCal payload. The canonical body lives in SharedEvents;
+// PersonalEvents and CalendarEvents hold member annotations and are tried
+// as a fallback. Returns an error when no part could be decrypted.
+func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing) (summary, location string, err error) {
+	// Decode the calendar key packet without the library helper, which
+	// panics on malformed base64; a bad packet just falls back to the
+	// armored path (kp empty) for this event.
+	var calKP []byte
+	if ev.CalendarKeyPacket != "" {
+		if raw, derr := base64.StdEncoding.DecodeString(ev.CalendarKeyPacket); derr == nil {
+			calKP = raw
 		}
 	}
-	return summary, location
+	partSets := [][]proton.CalendarEventPart{ev.SharedEvents, ev.PersonalEvents, ev.CalendarEvents}
+	for _, parts := range partSets {
+		for _, part := range parts {
+			data, derr := decryptPart(part, calKR, addrKR, calKP)
+			if derr != nil {
+				err = derr
+				continue
+			}
+			if summary == "" {
+				summary = icalProp(data, "SUMMARY")
+			}
+			if location == "" {
+				location = icalProp(data, "LOCATION")
+			}
+			if summary != "" && location != "" {
+				return summary, location, nil
+			}
+			// A part decrypted but carried neither field; keep looking,
+			// but this is no longer a failure.
+			err = nil
+		}
+	}
+	if err == nil && summary == "" && location == "" {
+		err = fmt.Errorf("no decryptable part with SUMMARY/LOCATION")
+	}
+	return summary, location, err
+}
+
+// decryptPart replicates proton.CalendarEventPart.Decode but returns the
+// decrypted string (the upstream method's assignment is lost in some
+// versions) and takes the event's calendar key packet, without which the
+// split-message parts cannot be decrypted.
+func decryptPart(part proton.CalendarEventPart, calKR, addrKR *crypto.KeyRing, kp []byte) (string, error) {
+	data := part.Data
+
+	if part.Type&proton.CalendarEventTypeEncrypted != 0 {
+		var enc *crypto.PGPMessage
+
+		if len(kp) > 0 {
+			raw, err := base64.StdEncoding.DecodeString(data)
+			if err != nil {
+				return "", fmt.Errorf("base64 decode: %w", err)
+			}
+			enc = crypto.NewPGPSplitMessage(kp, raw).GetPGPMessage()
+		} else {
+			var err error
+			if enc, err = crypto.NewPGPMessageFromArmored(data); err != nil {
+				return "", fmt.Errorf("parse armored: %w", err)
+			}
+		}
+
+		dec, err := calKR.Decrypt(enc, nil, crypto.GetUnixTime())
+		if err != nil {
+			return "", fmt.Errorf("decrypt: %w", err)
+		}
+
+		data = dec.GetString()
+	}
+
+	if part.Type&proton.CalendarEventTypeSigned != 0 {
+		sig, err := crypto.NewPGPSignatureFromArmored(part.Signature)
+		if err != nil {
+			return "", fmt.Errorf("parse sig: %w", err)
+		}
+		if err := addrKR.VerifyDetached(crypto.NewPlainMessageFromString(data), sig, crypto.GetUnixTime()); err != nil {
+			return "", fmt.Errorf("verify sig: %w", err)
+		}
+	}
+
+	return data, nil
 }
 
 // icalProp pulls the named property out of an iCal VEVENT payload,
