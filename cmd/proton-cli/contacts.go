@@ -5,8 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"strings"
-
-	proton "github.com/ProtonMail/go-proton-api"
 )
 
 func cmdContacts(ctx context.Context, args []string) error {
@@ -61,9 +59,4 @@ func cmdContacts(ctx context.Context, args []string) error {
 	}
 
 	return emitJSON(out)
-}
-
-// contactByID fetches one contact; kept for future use by send flows.
-func contactByID(ctx context.Context, c *proton.Client, id string) (proton.Contact, error) {
-	return c.GetContact(ctx, id)
 }
