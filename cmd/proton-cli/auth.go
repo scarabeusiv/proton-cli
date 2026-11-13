@@ -62,6 +62,9 @@ func cmdLogin(ctx context.Context, args []string) error {
 		}
 		defer zero(code)
 
+		// string(code) copies the code into an immutable string the GC
+		// owns; it cannot be zeroed. The []byte is zeroed by the
+		// deferred call above.
 		if err := c.Auth2FA(ctx, proton.Auth2FAReq{TwoFactorCode: string(code)}); err != nil {
 			return fmt.Errorf("2FA failed: %w", err)
 		}
