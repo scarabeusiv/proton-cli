@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,10 @@ type session struct {
 	Salts proton.Salts `json:"salts,omitempty"`
 }
 
+// errNoSession reports that no session file exists at all, as opposed to
+// a session file that is present but unreadable or corrupt.
+var errNoSession = errors.New("no session file")
+
 func sessionPath() (string, error) {
 	dir, err := os.UserConfigDir()
 	if err != nil {
@@ -43,7 +48,12 @@ func loadSession() (session, error) {
 
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return s, fmt.Errorf("no session — run `proton-cli login` first")
+		// A missing file means "never logged in"; any other read error
+		// (permissions, I/O) means the file is there but unusable.
+		if os.IsNotExist(err) {
+			return s, fmt.Errorf("%w — run `proton-cli login` first", errNoSession)
+		}
+		return s, fmt.Errorf("read session file: %w", err)
 	}
 
 	if err := json.Unmarshal(b, &s); err != nil {
