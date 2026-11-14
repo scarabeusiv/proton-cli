@@ -301,6 +301,20 @@ func cmdEvents(ctx context.Context, args []string) error {
 		}
 	}
 
+	// Verify shared-calendar events too: the verification ring adds
+	// the other members' public keys (see buildVerificationKeyring).
+	var verifyKR *crypto.KeyRing
+	if *decrypt && !useDaemon && addrKR != nil {
+		var verr error
+		verifyKR, verr = buildVerificationKeyring(ctx, c, *calendarID, addrKR)
+		if verr != nil {
+			// Fall back to the bare address keyring: this account's
+			// own events still decrypt.
+			fmt.Fprintf(os.Stderr, "verification keyring: %v (own events only)\n", verr)
+			verifyKR = addrKR
+		}
+	}
+
 	events, err := listCalendarEvents(ctx, c, *calendarID, filter, first)
 	if err != nil {
 		return fmt.Errorf("list events: %w", err)
@@ -337,7 +351,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 			if useDaemon {
 				s.Summary, s.Location, _, err = daemonDecryptEvent(*calendarID, &ev)
 			} else if calKR != nil {
-				s.Summary, s.Location, _, err = decryptEventDetails(&ev, calKR, addrKR)
+				s.Summary, s.Location, _, err = decryptEventDetails(&ev, calKR, verifyKR)
 			}
 			if err != nil {
 				decryptFailed++
@@ -356,6 +370,61 @@ func cmdEvents(ctx context.Context, args []string) error {
 	}
 
 	return emitJSON(out)
+}
+
+// buildVerificationKeyring returns the keyring used to verify calendar
+// event signatures for calendarID: the account's own address keys
+// (base) plus the public keys of the calendar's other members.
+// Event parts are signed by their author's address key, so a shared
+// calendar's events fail verification with "signature made by unknown
+// entity" unless the author's public key is in the ring. Members
+// matching the account's own addresses are skipped: their keys are
+// already in base. A member whose public keys cannot be fetched is
+// skipped (its events fail verification and are logged, as before)
+// rather than failing the whole feed.
+func buildVerificationKeyring(ctx context.Context, c *proton.Client, calendarID string, base *crypto.KeyRing) (*crypto.KeyRing, error) {
+	members, err := c.GetCalendarMembers(ctx, calendarID)
+	if err != nil {
+		return nil, fmt.Errorf("get calendar members: %w", err)
+	}
+	addrs, err := c.GetAddresses(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get addresses: %w", err)
+	}
+	own := make(map[string]bool, len(addrs))
+	for _, a := range addrs {
+		own[strings.ToLower(a.Email)] = true
+	}
+	vr, err := crypto.NewKeyRing(nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, k := range base.GetKeys() {
+		if err := vr.AddKey(k); err != nil {
+			return nil, err
+		}
+	}
+	for _, m := range members {
+		if own[strings.ToLower(m.Email)] {
+			continue
+		}
+		pub, _, err := c.GetPublicKeys(ctx, m.Email)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "verification keyring: get public keys for %s: %v (skipped)\n", m.Email, err)
+			continue
+		}
+		pkr, err := pub.GetKeyRing()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "verification keyring: public keys for %s: %v (skipped)\n", m.Email, err)
+			continue
+		}
+		for _, k := range pkr.GetKeys() {
+			if err := vr.AddKey(k); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return vr, nil
 }
 
 // decryptEventDetails extracts the SUMMARY, LOCATION and DESCRIPTION
