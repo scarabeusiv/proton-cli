@@ -344,7 +344,7 @@ func rotatingDaemon(t *testing.T) (*mockAPI, *daemon) {
 	}
 	// The eager refresh rotated test-refresh -> refresh-1 /
 	// access-1; the daemon is the only owner of that client now.
-	return m, newDaemon(c, mgr, auth, testKeyRing(t), 8765, 30, 365)
+	return m, newDaemon(c, mgr, auth, testKeyRing(t), 8765, defaultICSDaysPast, defaultICSDaysFuture)
 }
 
 // TestDaemonAccessTokenOp covers the daemon-owns-token path: the op
