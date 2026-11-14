@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	proton "github.com/ProtonMail/go-proton-api"
@@ -64,28 +65,73 @@ type eventSummary struct {
 // calendar endpoint rejects (400 Code 2021).
 const calendarPageSize = 100
 
+// calendarPageBatchSize is how many calendar pages are fetched
+// concurrently in one batch. The server ignores the Begin/End filter
+// and returns every event in the calendar, 100 per page, and a single
+// page takes 10-30s server-side; fetching pages one at a time makes a
+// whole calendar take minutes and the ICS feed exceed its timeout.
+// Pages are independent (page N does not depend on page N-1), so they
+// are fetched concurrently. A short page ends the list; the batch
+// that contains it is still fully fetched (the pages after a short
+// page return empty).
+const calendarPageBatchSize = 12
+
 // listCalendarEvents pages through the calendar API. first is the
 // already-fetched page 0; the remaining pages are fetched here, so the
 // caller can inspect page 0 (e.g. to skip a password prompt for an empty
-// range) without re-fetching it. The page count is capped: a server
-// returning full pages forever would otherwise loop forever and grow
-// memory without bound. Failing closed (instead of silently truncating)
-// keeps a truncated list from passing as complete.
+// range) without re-fetching it. The remaining pages are fetched in
+// parallel batches (see calendarPageBatchSize): the server returns the
+// whole calendar regardless of the window, so a sequential fetch takes
+// minutes. The page count is capped: a server returning full pages
+// forever would otherwise loop forever and grow memory without bound.
+// Failing closed (instead of silently truncating) keeps a truncated
+// list from passing as complete.
 func listCalendarEvents(ctx context.Context, c *proton.Client, calendarID string, filter url.Values, first []proton.CalendarEvent) ([]proton.CalendarEvent, error) {
 	const maxPages = 100
 	all := append([]proton.CalendarEvent{}, first...)
 	if len(first) < calendarPageSize {
 		return all, nil
 	}
-	for page := 1; page < maxPages; page++ {
-		evs, err := c.GetCalendarEvents(ctx, calendarID, page, calendarPageSize, filter)
-		if err != nil {
-			return nil, err
+	for page := 1; page < maxPages; {
+		batchEnd := page + calendarPageBatchSize
+		if batchEnd > maxPages {
+			batchEnd = maxPages
 		}
-		all = append(all, evs...)
-		if len(evs) < calendarPageSize {
+		// Fetch pages [page, batchEnd) concurrently. Each goroutine
+		// writes only its own slot, so no synchronisation is needed
+		// beyond the WaitGroup; the client is safe for concurrent
+		// use (the library's own fetchPaged does the same).
+		type pageResult struct {
+			evs []proton.CalendarEvent
+			err error
+		}
+		results := make([]pageResult, batchEnd-page)
+		var wg sync.WaitGroup
+		for i := page; i < batchEnd; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				evs, err := c.GetCalendarEvents(ctx, calendarID, i, calendarPageSize, filter)
+				results[i-page] = pageResult{evs: evs, err: err}
+			}(i)
+		}
+		wg.Wait()
+		// Append in page order. A short page ends the list; pages
+		// after it in this batch return empty.
+		short := false
+		for _, r := range results {
+			if r.err != nil {
+				return nil, r.err
+			}
+			all = append(all, r.evs...)
+			if len(r.evs) < calendarPageSize {
+				short = true
+			}
+		}
+		if short {
 			return all, nil
 		}
+		page = batchEnd
 	}
 	return nil, fmt.Errorf("calendar event list exceeded %d pages of %d events; refusing to fetch more", maxPages, calendarPageSize)
 }
