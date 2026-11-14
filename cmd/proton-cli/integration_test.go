@@ -972,6 +972,64 @@ func TestIntegrationDaemonSharedCalendarMemberDecrypt(t *testing.T) {
 	}
 }
 
+func TestIntegrationDaemonSharedCalendarAuthorDecrypt(t *testing.T) {
+	// A shared-calendar event whose author address differs from the
+	// calendar member's address must still decrypt in the ICS feed:
+	// the verification keyring fetches the author's public key as
+	// well as the members'. Without that, the event is skipped with
+	// "signature made by unknown entity" even though the member list
+	// is complete (the member's key is not the signing key).
+	kr := testKeyRing(t)
+	memberKR := testKeyRing(t)
+	authorKR := testKeyRing(t)
+	memberPub, err := memberKR.GetKeys()[0].GetArmoredPublicKey()
+	if err != nil {
+		t.Fatalf("member public key: %v", err)
+	}
+	authorPub, err := authorKR.GetKeys()[0].GetArmoredPublicKey()
+	if err != nil {
+		t.Fatalf("author public key: %v", err)
+	}
+	now := time.Now()
+	// Signed by authorKR; the author address is not the member address.
+	ev := testSignedMockEvent(t, kr, authorKR, "ev-author",
+		now.Add(1*time.Hour).Unix(), now.Add(2*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Author Dinner\nEND:VEVENT", "author@example.com")
+	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{ev},
+		addresses: []map[string]any{{"ID": "addr1", "Email": "test@example.com"}},
+		members: []map[string]any{
+			{"ID": "m1", "Email": "test@example.com"},
+			{"ID": "m2", "Email": "member@example.com"},
+		},
+		memberPubKeys: map[string]string{
+			"member@example.com": memberPub,
+			"author@example.com": authorPub,
+		},
+	}
+	newMockAPI(t, m)
+
+	d := testDaemonWithMockAPI(t, kr)
+	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/calendar.ics")
+	if err != nil {
+		t.Fatalf("GET /calendar.ics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /calendar.ics status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read feed: %v", err)
+	}
+	feed := string(body)
+	if !strings.Contains(feed, "SUMMARY:Author Dinner") {
+		t.Errorf("ICS feed missing the author-signed event in:\n%s", feed)
+	}
+}
+
 func TestIntegrationDaemonICSFeedFetchFailure(t *testing.T) {
 	// A fetch failure must serve 503 with a plain error, never a stale feed.
 	m := &mockAPI{t: t, calendarsErr: true}

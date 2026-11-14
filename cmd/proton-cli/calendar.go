@@ -303,20 +303,6 @@ func cmdEvents(ctx context.Context, args []string) error {
 		}
 	}
 
-	// Verify shared-calendar events too: the verification ring adds
-	// the other members' public keys (see buildVerificationKeyring).
-	var verifyKR *crypto.KeyRing
-	if *decrypt && !useDaemon && addrKR != nil {
-		var verr error
-		verifyKR, verr = buildVerificationKeyring(ctx, c, *calendarID, addrKR)
-		if verr != nil {
-			// Fall back to the bare address keyring: this account's
-			// own events still decrypt.
-			fmt.Fprintf(os.Stderr, "verification keyring: %v (own events only)\n", verr)
-			verifyKR = addrKR
-		}
-	}
-
 	events, err := listCalendarEvents(ctx, c, *calendarID, filter, first)
 	if err != nil {
 		return fmt.Errorf("list events: %w", err)
@@ -333,6 +319,21 @@ func cmdEvents(ctx context.Context, args []string) error {
 		}
 	}
 	events = inRange
+
+	// Verify shared-calendar events too: the verification ring adds
+	// the other members' public keys and the public keys of the
+	// events' authors (see buildVerificationKeyring).
+	var verifyKR *crypto.KeyRing
+	if *decrypt && !useDaemon && addrKR != nil {
+		var verr error
+		verifyKR, verr = buildVerificationKeyring(ctx, c, *calendarID, addrKR, collectAuthorEmails(events))
+		if verr != nil {
+			// Fall back to the bare address keyring: this account's
+			// own events still decrypt.
+			fmt.Fprintf(os.Stderr, "verification keyring: %v (own events only)\n", verr)
+			verifyKR = addrKR
+		}
+	}
 
 	out := make([]eventSummary, 0, len(events))
 	decryptFailed := 0
@@ -374,17 +375,85 @@ func cmdEvents(ctx context.Context, args []string) error {
 	return emit(out, func() { printEvents(out) })
 }
 
+// collectAuthorEmails returns the distinct author emails found on the
+// events and their parts, for verification-key fetching. An event part
+// is signed by its author's address key, and the calendar member list
+// may name a different address for the same person (or none at all),
+// so the author addresses are fetched as well as the members'.
+// Non-email authors are ignored.
+func collectAuthorEmails(events []proton.CalendarEvent) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(email string) {
+		email = strings.ToLower(strings.TrimSpace(email))
+		if email == "" || !strings.Contains(email, "@") || seen[email] {
+			return
+		}
+		seen[email] = true
+		out = append(out, email)
+	}
+	for _, ev := range events {
+		add(ev.Author)
+		for _, part := range ev.SharedEvents {
+			add(part.Author)
+		}
+		for _, part := range ev.CalendarEvents {
+			add(part.Author)
+		}
+		for _, part := range ev.PersonalEvents {
+			add(part.Author)
+		}
+		for _, part := range ev.AttendeesEvents {
+			add(part.Author)
+		}
+	}
+	return out
+}
+
+// addVerificationKeys fetches the public keys for one address and adds
+// them to vr, returning how many were added. An address whose keys
+// cannot be fetched, or that yields no keys, is logged and skipped
+// (returns 0, nil) rather than failing the caller. Only a local
+// keyring failure (AddKey) returns an error.
+func addVerificationKeys(ctx context.Context, c *proton.Client, vr *crypto.KeyRing, email string) (int, error) {
+	pub, _, err := c.GetPublicKeys(ctx, email)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "verification keyring: get public keys for %s: %v (skipped)\n", email, err)
+		return 0, nil
+	}
+	pkr, err := pub.GetKeyRing()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "verification keyring: public keys for %s: %v (skipped)\n", email, err)
+		return 0, nil
+	}
+	n := 0
+	for _, k := range pkr.GetKeys() {
+		if err := vr.AddKey(k); err != nil {
+			return n, err
+		}
+		n++
+	}
+	if n == 0 {
+		fmt.Fprintf(os.Stderr, "verification keyring: no public keys for %s (skipped)\n", email)
+	}
+	return n, nil
+}
+
 // buildVerificationKeyring returns the keyring used to verify calendar
 // event signatures for calendarID: the account's own address keys
-// (base) plus the public keys of the calendar's other members.
+// (base) plus the public keys of the calendar's other members and of
+// extraAuthors (the authors of the events being decrypted).
 // Event parts are signed by their author's address key, so a shared
 // calendar's events fail verification with "signature made by unknown
-// entity" unless the author's public key is in the ring. Members
-// matching the account's own addresses are skipped: their keys are
-// already in base. A member whose public keys cannot be fetched is
-// skipped (its events fail verification and are logged, as before)
-// rather than failing the whole feed.
-func buildVerificationKeyring(ctx context.Context, c *proton.Client, calendarID string, base *crypto.KeyRing) (*crypto.KeyRing, error) {
+// entity" unless the author's public key is in the ring. The member
+// list alone is not sufficient: it may name an address whose keys
+// differ from the address that signed the event, or an address with
+// no published keys. Members and authors matching the account's own
+// addresses are skipped: their keys are already in base. An address
+// whose public keys cannot be fetched is skipped (its events fail
+// verification and are logged, as before) rather than failing the
+// whole feed.
+func buildVerificationKeyring(ctx context.Context, c *proton.Client, calendarID string, base *crypto.KeyRing, extraAuthors []string) (*crypto.KeyRing, error) {
 	members, err := c.GetCalendarMembers(ctx, calendarID)
 	if err != nil {
 		return nil, fmt.Errorf("get calendar members: %w", err)
@@ -406,26 +475,27 @@ func buildVerificationKeyring(ctx context.Context, c *proton.Client, calendarID 
 			return nil, err
 		}
 	}
+	seen := make(map[string]bool)
+	fetch := func(email string) error {
+		email = strings.ToLower(strings.TrimSpace(email))
+		if email == "" || own[email] || seen[email] {
+			return nil
+		}
+		seen[email] = true
+		_, err := addVerificationKeys(ctx, c, vr, email)
+		return err
+	}
 	for _, m := range members {
-		if own[strings.ToLower(m.Email)] {
-			continue
-		}
-		pub, _, err := c.GetPublicKeys(ctx, m.Email)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "verification keyring: get public keys for %s: %v (skipped)\n", m.Email, err)
-			continue
-		}
-		pkr, err := pub.GetKeyRing()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "verification keyring: public keys for %s: %v (skipped)\n", m.Email, err)
-			continue
-		}
-		for _, k := range pkr.GetKeys() {
-			if err := vr.AddKey(k); err != nil {
-				return nil, err
-			}
+		if err := fetch(m.Email); err != nil {
+			return nil, err
 		}
 	}
+	for _, email := range extraAuthors {
+		if err := fetch(email); err != nil {
+			return nil, err
+		}
+	}
+	fmt.Fprintf(os.Stderr, "verification keyring: calendar %s: %d members, %d authors, %d keys\n", calendarID, len(members), len(extraAuthors), len(vr.GetKeys()))
 	return vr, nil
 }
 
