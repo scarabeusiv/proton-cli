@@ -7,14 +7,22 @@ import (
 )
 
 // icsEvent is one decrypted calendar event, ready for the feed.
+// RRule is the raw RRULE value ("" when the event does not recur);
+// ExDates are the full EXDATE lines (with any parameters) verbatim;
+// RecurrenceID is the full RECURRENCE-ID line verbatim ("" unless this
+// event overrides one occurrence of a recurring series). A subscribing
+// calendar expands RRULE into occurrences itself.
 type icsEvent struct {
-	ID          string
-	Start       int64 // Unix seconds (UTC)
-	End         int64 // Unix seconds (UTC); exclusive for full-day events
-	FullDay     bool
-	Summary     string
-	Location    string
-	Description string
+	ID           string
+	Start        int64 // Unix seconds (UTC)
+	End          int64 // Unix seconds (UTC); exclusive for full-day events
+	FullDay      bool
+	Summary      string
+	Location     string
+	Description  string
+	RRule        string
+	ExDates      []string
+	RecurrenceID string
 }
 
 // escapeICSText escapes a value per RFC 5545 section 3.3.11 (TEXT):
@@ -74,6 +82,15 @@ func icsFeed(events []icsEvent, now time.Time) string {
 		} else {
 			fmt.Fprintf(&b, "DTSTART:%s\r\n", icsDateTime(time.Unix(ev.Start, 0)))
 			fmt.Fprintf(&b, "DTEND:%s\r\n", icsDateTime(time.Unix(ev.End, 0)))
+		}
+		if ev.RRule != "" {
+			fmt.Fprintf(&b, "RRULE:%s\r\n", ev.RRule)
+		}
+		for _, ex := range ev.ExDates {
+			fmt.Fprintf(&b, "%s\r\n", ex)
+		}
+		if ev.RecurrenceID != "" {
+			fmt.Fprintf(&b, "%s\r\n", ev.RecurrenceID)
 		}
 		if ev.Summary != "" {
 			fmt.Fprintf(&b, "SUMMARY:%s\r\n", escapeICSText(ev.Summary))
