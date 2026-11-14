@@ -292,6 +292,12 @@ type mockAPI struct {
 	// fails with 10013) and makes the calendar/user endpoints reject
 	// a stale access token with 401, mimicking Proton's rotation.
 	rotatingRefresh bool
+	// eventsDelay sleeps this long before answering the events
+	// endpoint. onEvents, when set, runs when the events endpoint
+	// is hit (before any delay). Tests use them to hold a feed
+	// fetch open while the request context is cancelled.
+	eventsDelay time.Duration
+	onEvents    func()
 
 	calendars []map[string]any
 	events    []map[string]any // paged by 100, in order
@@ -389,6 +395,12 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
 			fmt.Fprint(w, `{"Code":10012,"Error":"invalid access token"}`)
 			return
+		}
+		if m.onEvents != nil {
+			m.onEvents()
+		}
+		if m.eventsDelay > 0 {
+			time.Sleep(m.eventsDelay)
 		}
 		m.mu.Lock()
 		m.eventQueries = append(m.eventQueries, r.URL.Query())
@@ -802,7 +814,7 @@ func testDaemonWithMockAPI(t *testing.T, kr *crypto.KeyRing) *daemon {
 	})
 	// Build via newDaemon so the daemon tracks the tokens the
 	// access_token op hands out (a struct literal leaves them empty).
-	d := newDaemon(c, mgr, auth, kr, 8765, 30, 365)
+	d := newDaemon(c, mgr, auth, kr, 8765, defaultICSDaysPast, defaultICSDaysFuture)
 	d.calKR["cal1"] = kr
 	return d
 }
@@ -884,6 +896,56 @@ func TestIntegrationDaemonICSFeedFetchFailure(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "failed to build feed") {
 		t.Errorf("GET /calendar.ics error body = %q, want it to mention the failed feed", body)
+	}
+}
+
+func TestIntegrationDaemonICSFeedSurvivesCancelledRequest(t *testing.T) {
+	// A cancelled HTTP request context must not cancel the feed fetch:
+	// the handler detaches the fetch onto a background context, so a
+	// subscribing calendar that gives up mid-fetch cannot kill it.
+	kr := testKeyRing(t)
+	now := time.Now()
+	ev := testEncryptedMockEvent(t, kr, "ev-detach",
+		now.Add(1*time.Hour).Unix(), now.Add(2*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Detach Test\nEND:VEVENT")
+	eventsStarted := make(chan struct{}, 1)
+	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{ev},
+		eventsDelay: 500 * time.Millisecond,
+		onEvents: func() {
+			select {
+			case eventsStarted <- struct{}{}:
+			default:
+			}
+		}}
+	newMockAPI(t, m)
+
+	d := testDaemonWithMockAPI(t, kr)
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/calendar.ics", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		d.handleICSFeed(rec, req)
+		close(done)
+	}()
+	// Wait until the mock has seen the events request, so the fetch
+	// is in flight, then cancel the request context.
+	select {
+	case <-eventsStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mock never received the events request")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handleICSFeed did not return after the request context was cancelled")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /calendar.ics after cancel status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "UID:ev-detach@proton-cli") {
+		t.Errorf("ICS feed missing the detached event in:\n%s", rec.Body.String())
 	}
 }
 

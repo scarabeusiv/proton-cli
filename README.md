@@ -77,18 +77,21 @@ piped stdin, decrypt commands keep prompting per command. `logout`
 stops a running daemon before revoking the session.
 
 ```sh
-proton-cli daemon start [--ics-port 8765] [--ics-days-past 30] [--ics-days-future 365] [--foreground]
+proton-cli daemon start [--ics-port 8765] [--ics-days-past 7] [--ics-days-future 90] [--foreground]
 proton-cli daemon stop
 proton-cli daemon status   # JSON: {"running": true, "ics_url": "..."}
 proton-cli daemon ics      # print the feed URL and subscription steps
 ```
 
 The ICS feed (`http://127.0.0.1:8765/calendar.ics` by default) contains
-the decrypted events for the past 30 days through the next 365 days
+the decrypted events for the past 7 days through the next 90 days
 (configurable with the `--ics-days-past` / `--ics-days-future` flags on
 `daemon start`). It is regenerated from Proton on every request, so a
 subscribing calendar sees current data on its next poll; a fetch
-failure serves 503, never a stale feed. It is served only while the
+failure serves 503, never a stale feed. The fetch runs detached from
+the HTTP request, so a subscribing calendar that gives up mid-fetch
+cannot cancel it; the feed is still generated fresh and discarded
+afterwards — nothing decrypted is cached. It is served only while the
 daemon is running.
 
 Subscribe in Apple Calendar: Calendar > Add Account > Other > Add

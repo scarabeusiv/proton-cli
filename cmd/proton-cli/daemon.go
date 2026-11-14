@@ -43,8 +43,12 @@ const (
 	// defaultICSPort is the HTTP port for the read-only ICS feed.
 	defaultICSPort = 8765
 	// defaultICSDaysPast / defaultICSDaysFuture bound the ICS feed window.
-	defaultICSDaysPast   = 30
-	defaultICSDaysFuture = 365
+	defaultICSDaysPast   = 7
+	defaultICSDaysFuture = 90
+	// icsFetchTimeout bounds one ICS feed fetch (list calendars, fetch
+	// events, decrypt). The fetch runs detached from the HTTP request
+	// (see handleICSFeed), so this is the only bound on a slow feed.
+	icsFetchTimeout = 120 * time.Second
 )
 
 // daemonSocketPathOverride, when non-empty, replaces the daemon socket
@@ -601,6 +605,8 @@ func (d *daemon) buildICSFeedWithRetry(ctx context.Context) (string, error) {
 // so a subscribing calendar sees current data on its next poll. A fetch
 // failure is an error (the handler serves 503, never a stale feed); an
 // individual event that fails to decrypt is skipped, not fatal.
+// The ctx is the detached fetch context from handleICSFeed, not the
+// HTTP request context, so a client disconnect cannot cancel the fetch.
 // The whole build uses one client snapshot, so a client swap mid-build
 // cannot mix tokens within a single feed.
 func (d *daemon) buildICSFeed(ctx context.Context) (string, error) {
@@ -656,6 +662,12 @@ func (d *daemon) buildICSFeed(ctx context.Context) (string, error) {
 
 // handleICSFeed serves the read-only feed. A fetch failure is a 503
 // with a plain error, never a stale feed.
+//
+// The fetch is detached from the HTTP request context: it runs on a
+// background context with icsFetchTimeout, so a subscribing calendar
+// that gives up (or times out) mid-fetch cannot cancel the in-flight
+// Proton API calls. The feed is still generated fresh on every
+// request and discarded afterwards — nothing decrypted is cached.
 func (d *daemon) handleICSFeed(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -665,7 +677,9 @@ func (d *daemon) handleICSFeed(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	feed, err := d.buildICSFeedWithRetry(r.Context())
+	fetchCtx, cancel := context.WithTimeout(context.Background(), icsFetchTimeout)
+	defer cancel()
+	feed, err := d.buildICSFeedWithRetry(fetchCtx)
 	if err != nil {
 		http.Error(w, "failed to build feed: "+err.Error(), http.StatusServiceUnavailable)
 		return
