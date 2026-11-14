@@ -209,15 +209,15 @@ func TestSummarize(t *testing.T) {
 
 func TestDecryptEventDetailsNoParts(t *testing.T) {
 	ev := &proton.CalendarEvent{ID: "ev1"}
-	summary, location, _, err := decryptEventDetails(ev, nil, nil)
+	det, err := decryptEventDetails(ev, nil, nil)
 	if err == nil {
 		t.Fatal("decryptEventDetails with no parts: expected error, got nil")
 	}
 	if !strings.Contains(err.Error(), "no parts to decrypt") {
 		t.Errorf("decryptEventDetails error = %v, want it to mention no parts", err)
 	}
-	if summary != "" || location != "" {
-		t.Errorf("decryptEventDetails no parts = %q/%q, want empty", summary, location)
+	if det.Summary != "" || det.Location != "" {
+		t.Errorf("decryptEventDetails no parts = %q/%q, want empty", det.Summary, det.Location)
 	}
 }
 
@@ -230,12 +230,12 @@ func TestDecryptEventDetailsPlainPart(t *testing.T) {
 			{Type: 0, Data: "BEGIN:VEVENT\nSUMMARY:Hello\nLOCATION:Paris\nDESCRIPTION:See you there\nEND:VEVENT"},
 		},
 	}
-	summary, location, description, err := decryptEventDetails(ev, nil, nil)
+	det, err := decryptEventDetails(ev, nil, nil)
 	if err != nil {
 		t.Fatalf("decryptEventDetails plain part error: %v", err)
 	}
-	if summary != "Hello" || location != "Paris" || description != "See you there" {
-		t.Errorf("decryptEventDetails = %q/%q/%q, want Hello/Paris/See you there", summary, location, description)
+	if det.Summary != "Hello" || det.Location != "Paris" || det.Description != "See you there" {
+		t.Errorf("decryptEventDetails = %q/%q/%q, want Hello/Paris/See you there", det.Summary, det.Location, det.Description)
 	}
 }
 
@@ -246,12 +246,51 @@ func TestDecryptEventDetailsPlainPartNoFields(t *testing.T) {
 			{Type: 0, Data: "BEGIN:VEVENT\nUID:x\nEND:VEVENT"},
 		},
 	}
-	_, _, _, err := decryptEventDetails(ev, nil, nil)
+	_, err := decryptEventDetails(ev, nil, nil)
 	if err == nil {
 		t.Fatal("decryptEventDetails with no SUMMARY/LOCATION: expected error, got nil")
 	}
 	if !strings.Contains(err.Error(), "no SUMMARY/LOCATION") {
 		t.Errorf("decryptEventDetails error = %v, want it to mention SUMMARY/LOCATION", err)
+	}
+}
+
+func TestDecryptEventDetailsRecurring(t *testing.T) {
+	ev := &proton.CalendarEvent{
+		ID: "ev1",
+		SharedEvents: []proton.CalendarEventPart{
+			{Type: 0, Data: "BEGIN:VEVENT\nSUMMARY:Morning pill\nRRULE:FREQ=DAILY;INTERVAL=1\nEXDATE:20261120T090000Z\nEND:VEVENT"},
+		},
+	}
+	det, err := decryptEventDetails(ev, nil, nil)
+	if err != nil {
+		t.Fatalf("decryptEventDetails recurring error: %v", err)
+	}
+	if det.Summary != "Morning pill" {
+		t.Errorf("Summary = %q, want Morning pill", det.Summary)
+	}
+	if det.RRule != "FREQ=DAILY;INTERVAL=1" {
+		t.Errorf("RRule = %q, want FREQ=DAILY;INTERVAL=1", det.RRule)
+	}
+	if len(det.ExDates) != 1 || det.ExDates[0] != "EXDATE:20261120T090000Z" {
+		t.Errorf("ExDates = %v, want [EXDATE:20261120T090000Z]", det.ExDates)
+	}
+	// An overridden instance carries RECURRENCE-ID.
+	ev2 := &proton.CalendarEvent{
+		ID: "ev2",
+		SharedEvents: []proton.CalendarEventPart{
+			{Type: 0, Data: "BEGIN:VEVENT\nSUMMARY:Moved pill\nRECURRENCE-ID:20261114T090000Z\nEND:VEVENT"},
+		},
+	}
+	det2, err := decryptEventDetails(ev2, nil, nil)
+	if err != nil {
+		t.Fatalf("decryptEventDetails override error: %v", err)
+	}
+	if det2.RecurrenceID != "RECURRENCE-ID:20261114T090000Z" {
+		t.Errorf("RecurrenceID = %q, want RECURRENCE-ID:20261114T090000Z", det2.RecurrenceID)
+	}
+	if det2.RRule != "" {
+		t.Errorf("RecurrenceID event RRule = %q, want empty", det2.RRule)
 	}
 }
 

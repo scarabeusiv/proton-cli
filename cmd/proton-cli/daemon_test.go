@@ -143,6 +143,51 @@ func TestICSFeedDescription(t *testing.T) {
 	}
 }
 
+func TestICSFeedRecurring(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	ev := icsEvent{
+		ID:      "ev-r",
+		Start:   time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC).Unix(),
+		End:     time.Date(2026, 10, 14, 9, 30, 0, 0, time.UTC).Unix(),
+		Summary: "Morning pill",
+		RRule:   "FREQ=DAILY;INTERVAL=1",
+		ExDates: []string{"EXDATE:20261120T090000Z"},
+	}
+	out := icsFeed([]icsEvent{ev}, now)
+	for _, want := range []string{
+		"UID:ev-r@proton-cli\r\n",
+		"RRULE:FREQ=DAILY;INTERVAL=1\r\n",
+		"EXDATE:20261120T090000Z\r\n",
+		"SUMMARY:Morning pill\r\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("icsFeed recurring event missing %q in:\n%s", want, out)
+		}
+	}
+	// RRULE precedes SUMMARY, so a subscriber sees the rule with the event.
+	if strings.Index(out, "RRULE:") > strings.Index(out, "SUMMARY:") {
+		t.Errorf("icsFeed RRULE must precede SUMMARY:\n%s", out)
+	}
+	// An overridden instance carries RECURRENCE-ID.
+	ov := icsEvent{
+		ID:           "ev-o",
+		Start:        time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC).Unix(),
+		End:          time.Date(2026, 11, 14, 10, 30, 0, 0, time.UTC).Unix(),
+		Summary:      "Moved pill",
+		RecurrenceID: "RECURRENCE-ID:20261114T090000Z",
+	}
+	out = icsFeed([]icsEvent{ov}, now)
+	if !strings.Contains(out, "RECURRENCE-ID:20261114T090000Z\r\n") {
+		t.Errorf("icsFeed override missing RECURRENCE-ID in:\n%s", out)
+	}
+	// A non-recurring event omits all three properties.
+	plain := icsEvent{ID: "ev-p", Start: 1700000000, End: 1700003600, Summary: "Once"}
+	out = icsFeed([]icsEvent{plain}, now)
+	if strings.Contains(out, "RRULE:") || strings.Contains(out, "EXDATE:") || strings.Contains(out, "RECURRENCE-ID:") {
+		t.Errorf("icsFeed non-recurring event must omit recurrence properties:\n%s", out)
+	}
+}
+
 // --- daemon socket protocol ---
 
 // testKeyRing generates a fast (ed25519) PGP keyring for tests.

@@ -943,6 +943,74 @@ func TestIntegrationDaemonICSFeed(t *testing.T) {
 	}
 }
 
+func TestIntegrationDaemonICSFeedRecurring(t *testing.T) {
+	// A daily recurring event whose master started 30 days ago (outside
+	// the 7-day past window) must still be in the feed, with its RRULE:
+	// its occurrences fall in the window even though the master does
+	// not. Without the RRULE the subscriber sees at most the one master
+	// instance; without the window fix it sees nothing at all.
+	kr := testKeyRing(t)
+	now := time.Now()
+	masterStart := now.Add(-30 * 24 * time.Hour)
+	daily := testEncryptedMockEvent(t, kr, "ev-daily",
+		masterStart.Unix(), masterStart.Add(1*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Morning pill\nRRULE:FREQ=DAILY;INTERVAL=1\nEND:VEVENT")
+	// A weekly recurring event in the window, with BYDAY.
+	weekStart := now.Add(1 * time.Hour)
+	weekly := testEncryptedMockEvent(t, kr, "ev-weekly",
+		weekStart.Unix(), weekStart.Add(1*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Sara gym\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR\nEND:VEVENT")
+	// A recurring event with an exception date.
+	exStart := now.Add(2 * time.Hour)
+	withEx := testEncryptedMockEvent(t, kr, "ev-exdate",
+		exStart.Unix(), exStart.Add(30*time.Minute).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Vitamins\nRRULE:FREQ=DAILY\nEXDATE:20261120T090000Z\nEND:VEVENT")
+	// A one-time event whose master ended before the window must stay out.
+	oldStart := now.Add(-30 * 24 * time.Hour)
+	old := testEncryptedMockEvent(t, kr, "ev-old",
+		oldStart.Unix(), oldStart.Add(1*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Old one-off\nEND:VEVENT")
+	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{daily, weekly, withEx, old}}
+	newMockAPI(t, m)
+
+	d := testDaemonWithMockAPI(t, kr)
+	enableTestDaemonICS(t, d)
+	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/calendar.ics")
+	if err != nil {
+		t.Fatalf("GET /calendar.ics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /calendar.ics status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read feed: %v", err)
+	}
+	feed := string(body)
+	for _, want := range []string{
+		"UID:ev-daily@proton-cli",
+		"SUMMARY:Morning pill",
+		"RRULE:FREQ=DAILY;INTERVAL=1",
+		"UID:ev-weekly@proton-cli",
+		"SUMMARY:Sara gym",
+		"RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR",
+		"UID:ev-exdate@proton-cli",
+		"SUMMARY:Vitamins",
+		"EXDATE:20261120T090000Z",
+	} {
+		if !strings.Contains(feed, want) {
+			t.Errorf("ICS feed missing %q in:\n%s", want, feed)
+		}
+	}
+	if strings.Contains(feed, "UID:ev-old@proton-cli") {
+		t.Errorf("ICS feed must not include a one-time event outside the window:\n%s", feed)
+	}
+}
+
 func TestIntegrationDaemonSharedCalendarMemberDecrypt(t *testing.T) {
 	// A shared-calendar event authored (signed) by another member must
 	// decrypt in the ICS feed: the verification keyring adds the

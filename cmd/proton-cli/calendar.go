@@ -354,7 +354,9 @@ func cmdEvents(ctx context.Context, args []string) error {
 			if useDaemon {
 				s.Summary, s.Location, _, err = daemonDecryptEvent(*calendarID, &ev)
 			} else if calKR != nil {
-				s.Summary, s.Location, _, err = decryptEventDetails(&ev, calKR, verifyKR)
+				var det eventDetails
+				det, err = decryptEventDetails(&ev, calKR, verifyKR)
+				s.Summary, s.Location = det.Summary, det.Location
 			}
 			if err != nil {
 				decryptFailed++
@@ -499,17 +501,33 @@ func buildVerificationKeyring(ctx context.Context, c *proton.Client, calendarID 
 	return vr, nil
 }
 
+// eventDetails is the decrypted content of one calendar event. RRule is
+// the raw RRULE value ("" when the event does not recur); ExDates are
+// the full EXDATE lines verbatim (parameters preserved); RecurrenceID
+// is the full RECURRENCE-ID line verbatim ("" unless this event
+// overrides one occurrence of a recurring series).
+type eventDetails struct {
+	Summary      string
+	Location     string
+	Description  string
+	RRule        string
+	ExDates      []string
+	RecurrenceID string
+}
+
 // decryptEventDetails extracts the SUMMARY, LOCATION and DESCRIPTION
-// properties from an event's decrypted iCal payload. The canonical body
+// properties from an event's decrypted iCal payload, plus the recurrence
+// properties (RRULE, EXDATE, RECURRENCE-ID) when present. The canonical body
 // lives in SharedEvents, encrypted with the shared session key
 // (SharedKeyPacket); PersonalEvents and CalendarEvents hold member
 // annotations, encrypted with the calendar session key
-// (CalendarKeyPacket). Returns an error when no part could be decrypted,
-// or when parts decrypted but carried neither field. DESCRIPTION is
-// optional: it is captured when present in a part decrypted before the
-// early return below (the canonical VEVENT carries it alongside
-// SUMMARY/LOCATION).
-func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing) (summary, location, description string, err error) {
+// (CalendarKeyPacket). Recurrence lives in the same canonical VEVENT as the
+// summary, so it is taken from the first part that carries it. Returns an
+// error when no part could be decrypted, or when parts decrypted but carried
+// neither field. DESCRIPTION is optional: it is captured when present in a
+// part decrypted before the early return below (the canonical VEVENT carries
+// it alongside SUMMARY/LOCATION).
+func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing) (eventDetails, error) {
 	sharedKP := decodeKeyPacket(ev.SharedKeyPacket)
 	calKP := decodeKeyPacket(ev.CalendarKeyPacket)
 	partSets := []struct {
@@ -520,6 +538,8 @@ func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing
 		{ev.PersonalEvents, calKP},
 		{ev.CalendarEvents, calKP},
 	}
+	var out eventDetails
+	var err error
 	decryptedAny := false
 	for _, set := range partSets {
 		for _, part := range set.parts {
@@ -531,17 +551,27 @@ func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing
 			}
 			data := part.Data
 			decryptedAny = true
-			if summary == "" {
-				summary = icalProp(data, "SUMMARY")
+			if out.Summary == "" {
+				out.Summary = icalProp(data, "SUMMARY")
 			}
-			if location == "" {
-				location = icalProp(data, "LOCATION")
+			if out.Location == "" {
+				out.Location = icalProp(data, "LOCATION")
 			}
-			if description == "" {
-				description = icalProp(data, "DESCRIPTION")
+			if out.Description == "" {
+				out.Description = icalProp(data, "DESCRIPTION")
 			}
-			if summary != "" && location != "" {
-				return summary, location, description, nil
+			// RRULE/RECURRENCE-ID occur once, EXDATE may repeat.
+			if out.RRule == "" {
+				out.RRule = icalProp(data, "RRULE")
+			}
+			if out.RecurrenceID == "" {
+				out.RecurrenceID = icalPropLine(data, "RECURRENCE-ID")
+			}
+			if len(out.ExDates) == 0 {
+				out.ExDates = icalPropLines(data, "EXDATE")
+			}
+			if out.Summary != "" && out.Location != "" {
+				return out, nil
 			}
 		}
 	}
@@ -549,12 +579,12 @@ func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing
 		if err == nil {
 			err = fmt.Errorf("event has no parts to decrypt")
 		}
-		return summary, location, description, err
+		return out, err
 	}
-	if summary == "" && location == "" {
-		return summary, location, description, fmt.Errorf("parts decrypted but no SUMMARY/LOCATION found")
+	if out.Summary == "" && out.Location == "" {
+		return out, fmt.Errorf("parts decrypted but no SUMMARY/LOCATION found")
 	}
-	return summary, location, description, nil
+	return out, nil
 }
 
 // decodeKeyPacket base64-decodes a key packet string; returns nil for an
@@ -571,12 +601,12 @@ func decodeKeyPacket(packet string) []byte {
 	return raw
 }
 
-// icalProp pulls the named property out of an iCal VEVENT payload,
-// unfolding continuation lines.
-func icalProp(ical, prop string) string {
+// unfoldICalLines splits an iCal payload into logical lines, unfolding
+// continuation lines (a line starting with a space or tab continues the
+// previous line).
+func unfoldICalLines(ical string) []string {
 	var unfolded []string
 	var current string
-
 	lines := splitLines(ical)
 	for _, line := range lines {
 		if line == "" {
@@ -594,24 +624,57 @@ func icalProp(ical, prop string) string {
 	if current != "" {
 		unfolded = append(unfolded, current)
 	}
+	return unfolded
+}
 
-	for _, line := range unfolded {
-		// Property may carry parameters: SUMMARY;X=1:value
-		name := line
-		if idx := indexOf(line, ':'); idx >= 0 {
-			name = line[:idx]
-		}
-		if idx := indexOf(name, ';'); idx >= 0 {
-			name = name[:idx]
-		}
-		if name == prop {
+// icalPropName returns the property name of an unfolded iCal line,
+// stripping any parameters (e.g. "SUMMARY;X=1:value" -> "SUMMARY").
+func icalPropName(line string) string {
+	name := line
+	if idx := indexOf(line, ':'); idx >= 0 {
+		name = line[:idx]
+	}
+	if idx := indexOf(name, ';'); idx >= 0 {
+		name = name[:idx]
+	}
+	return name
+}
+
+// icalProp pulls the named property out of an iCal VEVENT payload,
+// unfolding continuation lines.
+func icalProp(ical, prop string) string {
+	for _, line := range unfoldICalLines(ical) {
+		if icalPropName(line) == prop {
 			if idx := indexOf(line, ':'); idx >= 0 {
 				return unescapeICalText(line[idx+1:])
 			}
 		}
 	}
-
 	return ""
+}
+
+// icalPropLine returns the first full unfolded line for prop (parameters
+// preserved), or "" when absent. Used for properties whose parameters
+// matter (RECURRENCE-ID).
+func icalPropLine(ical, prop string) string {
+	for _, line := range unfoldICalLines(ical) {
+		if icalPropName(line) == prop {
+			return line
+		}
+	}
+	return ""
+}
+
+// icalPropLines returns every full unfolded line for prop (parameters
+// preserved). Used for properties that may repeat (EXDATE).
+func icalPropLines(ical, prop string) []string {
+	var out []string
+	for _, line := range unfoldICalLines(ical) {
+		if icalPropName(line) == prop {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 func splitLines(s string) []string {

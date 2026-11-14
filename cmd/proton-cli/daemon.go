@@ -629,11 +629,11 @@ func (d *daemon) handleRequest(ctx context.Context, req daemonRequest) (daemonRe
 			fmt.Fprintf(os.Stderr, "daemon: calendar %s: verification keyring: %v (own events only)\n", req.CalendarID, err)
 			verifyKR = d.addrKR
 		}
-		summary, location, description, err := decryptEventDetails(req.Event, calKR, verifyKR)
+		det, err := decryptEventDetails(req.Event, calKR, verifyKR)
 		if err != nil {
 			return daemonResponse{Error: fmt.Sprintf("decrypt event: %v", err)}, false
 		}
-		return daemonResponse{OK: true, Summary: summary, Location: location, Description: description}, false
+		return daemonResponse{OK: true, Summary: det.Summary, Location: det.Location, Description: det.Description}, false
 	default:
 		return daemonResponse{Error: fmt.Sprintf("unknown op %q", req.Op)}, false
 	}
@@ -732,23 +732,42 @@ func (d *daemon) buildICSFeed(ctx context.Context) (string, error) {
 			verifyKR = d.addrKR
 		}
 		for _, ev := range evs {
-			// The server may ignore Begin/End; filter locally too.
-			if ev.StartTime < to.Unix() && ev.EndTime > from.Unix() {
-				summary, location, description, err := decryptEventDetails(&ev, calKR, verifyKR)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "daemon: event %s: decrypt failed: %v (skipped)\n", ev.ID, err)
-					continue
-				}
-				events = append(events, icsEvent{
-					ID:          ev.ID,
-					Start:       ev.StartTime,
-					End:         ev.EndTime,
-					FullDay:     bool(ev.FullDay),
-					Summary:     summary,
-					Location:    location,
-					Description: description,
-				})
+			// An event that starts after the window ends cannot have
+			// any occurrence in the window, recurring or not; skip it
+			// without decrypting. Everything else is decrypted to
+			// learn whether it recurs: recurrence lives only in the
+			// decrypted iCal payload, not in the API struct.
+			if ev.StartTime >= to.Unix() {
+				continue
 			}
+			det, err := decryptEventDetails(&ev, calKR, verifyKR)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "daemon: event %s: decrypt failed: %v (skipped)\n", ev.ID, err)
+				continue
+			}
+			// The server may ignore Begin/End; filter locally too.
+			// A recurring event is included when the master started
+			// before the window ends: any occurrence in the window
+			// makes the whole series relevant, and the subscribing
+			// calendar expands RRULE itself. A series that ended
+			// before the window is over-included (harmless: the client
+			// finds no occurrences in range). Non-recurring events
+			// keep the overlap check.
+			if det.RRule == "" && ev.EndTime <= from.Unix() {
+				continue
+			}
+			events = append(events, icsEvent{
+				ID:           ev.ID,
+				Start:        ev.StartTime,
+				End:          ev.EndTime,
+				FullDay:      bool(ev.FullDay),
+				Summary:      det.Summary,
+				Location:     det.Location,
+				Description:  det.Description,
+				RRule:        det.RRule,
+				ExDates:      det.ExDates,
+				RecurrenceID: det.RecurrenceID,
+			})
 		}
 	}
 	return icsFeed(events, now), nil
