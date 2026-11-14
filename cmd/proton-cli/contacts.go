@@ -9,6 +9,7 @@ import (
 
 func cmdContacts(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("contacts", flag.ContinueOnError)
+	addJSONFlag(fs)
 	query := fs.String("query", "", "filter: name or email contains (case-insensitive, client-side)")
 	limitFlag := fs.Int("limit", 50, "max contacts to return (0 = no limit)")
 	if err := fs.Parse(args); err != nil {
@@ -61,7 +62,7 @@ func cmdContacts(ctx context.Context, args []string) error {
 			})
 
 			if limit > 0 && len(out) >= limit {
-				return emitJSON(out)
+				return emit(out, func() { printContacts(out) })
 			}
 		}
 		if len(batch) < contactPageSize {
@@ -69,5 +70,5 @@ func cmdContacts(ctx context.Context, args []string) error {
 		}
 	}
 
-	return emitJSON(out)
+	return emit(out, func() { printContacts(out) })
 }

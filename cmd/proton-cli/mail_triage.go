@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
+	"strings"
 
 	proton "github.com/ProtonMail/go-proton-api"
 )
@@ -31,6 +33,7 @@ func summarizeLabel(l proton.Label) labelSummary {
 // positional message IDs) and requires at least one.
 func parseMessageIDs(cmd string, args []string) ([]string, error) {
 	fs := flag.NewFlagSet("mail "+cmd, flag.ContinueOnError)
+	addJSONFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -56,7 +59,9 @@ func cmdMailMarkRead(ctx context.Context, args []string) error {
 	if err := c.MarkMessagesRead(ctx, ids...); err != nil {
 		return fmt.Errorf("mark read: %w", err)
 	}
-	return emitJSON(map[string]any{"status": "marked-read", "ids": ids})
+	return emit(map[string]any{"status": "marked-read", "ids": ids}, func() {
+		fmt.Fprintf(os.Stdout, "marked read: %s\n", strings.Join(ids, " "))
+	})
 }
 
 func cmdMailMarkUnread(ctx context.Context, args []string) error {
@@ -75,7 +80,9 @@ func cmdMailMarkUnread(ctx context.Context, args []string) error {
 	if err := c.MarkMessagesUnread(ctx, ids...); err != nil {
 		return fmt.Errorf("mark unread: %w", err)
 	}
-	return emitJSON(map[string]any{"status": "marked-unread", "ids": ids})
+	return emit(map[string]any{"status": "marked-unread", "ids": ids}, func() {
+		fmt.Fprintf(os.Stdout, "marked unread: %s\n", strings.Join(ids, " "))
+	})
 }
 
 func cmdMailDelete(ctx context.Context, args []string) error {
@@ -94,11 +101,14 @@ func cmdMailDelete(ctx context.Context, args []string) error {
 	if err := c.DeleteMessage(ctx, ids...); err != nil {
 		return fmt.Errorf("delete: %w", err)
 	}
-	return emitJSON(map[string]any{"status": "deleted", "ids": ids})
+	return emit(map[string]any{"status": "deleted", "ids": ids}, func() {
+		fmt.Fprintf(os.Stdout, "deleted: %s\n", strings.Join(ids, " "))
+	})
 }
 
 func cmdMailLabels(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mail labels", flag.ContinueOnError)
+	addJSONFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -118,11 +128,12 @@ func cmdMailLabels(ctx context.Context, args []string) error {
 	for _, l := range labels {
 		out = append(out, summarizeLabel(l))
 	}
-	return emitJSON(out)
+	return emit(out, func() { printLabels(out) })
 }
 
 func cmdMailLabel(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mail label", flag.ContinueOnError)
+	addJSONFlag(fs)
 	add := fs.String("add", "", "label ID to add")
 	remove := fs.String("remove", "", "label ID to remove")
 	if err := fs.Parse(args); err != nil {
@@ -153,11 +164,21 @@ func cmdMailLabel(ctx context.Context, args []string) error {
 			return fmt.Errorf("remove label %s: %w", *remove, err)
 		}
 	}
-	return emitJSON(map[string]any{"status": "labelled", "ids": ids, "added": *add, "removed": *remove})
+	return emit(map[string]any{"status": "labelled", "ids": ids, "added": *add, "removed": *remove}, func() {
+		s := "labelled " + strings.Join(ids, " ")
+		if *add != "" {
+			s += " (added: " + *add + ")"
+		}
+		if *remove != "" {
+			s += " (removed: " + *remove + ")"
+		}
+		fmt.Fprintln(os.Stdout, s)
+	})
 }
 
 func cmdMailCreateLabel(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mail create-label", flag.ContinueOnError)
+	addJSONFlag(fs)
 	name := fs.String("name", "", "label name (required)")
 	color := fs.String("color", "#808080", "label colour as a hex code (e.g. #e67e22)")
 	if err := fs.Parse(args); err != nil {
@@ -182,5 +203,6 @@ func cmdMailCreateLabel(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("create label: %w", err)
 	}
-	return emitJSON(summarizeLabel(label))
+	ls := summarizeLabel(label)
+	return emit(ls, func() { printLabel(ls) })
 }

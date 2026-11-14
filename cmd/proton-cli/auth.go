@@ -14,6 +14,7 @@ import (
 
 func cmdLogin(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
+	addJSONFlag(fs)
 	username := fs.String("username", "", "Proton username (required)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -82,11 +83,14 @@ func cmdLogin(ctx context.Context, args []string) error {
 	}
 
 	fmt.Fprintln(os.Stderr, "logged in; session stored (password was not saved)")
-	return emitJSON(map[string]string{"status": "logged_in", "uid": auth.UID})
+	return emit(map[string]string{"status": "logged_in", "uid": auth.UID}, func() {
+		fmt.Fprintf(os.Stdout, "logged in as %s\n", auth.UID)
+	})
 }
 
 func cmdLogout(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("logout", flag.ContinueOnError)
+	addJSONFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -108,11 +112,14 @@ func cmdLogout(ctx context.Context, args []string) error {
 		return err
 	}
 
-	return emitJSON(map[string]string{"status": "logged_out"})
+	return emit(map[string]string{"status": "logged_out"}, func() {
+		fmt.Fprintln(os.Stdout, "logged out")
+	})
 }
 
 func cmdStatus(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	addJSONFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -120,26 +127,41 @@ func cmdStatus(ctx context.Context, args []string) error {
 	s, err := loadSession()
 	if err != nil {
 		if errors.Is(err, errNoSession) {
-			return emitJSON(map[string]string{"status": "no_session"})
+			return emit(map[string]string{"status": "no_session"}, func() {
+				fmt.Fprintln(os.Stdout, "status: no session")
+			})
 		}
-		return emitJSON(map[string]any{"status": "session_corrupt", "error": err.Error()})
+		return emit(map[string]any{"status": "session_corrupt", "error": err.Error()}, func() {
+			fmt.Fprintln(os.Stdout, "status: session corrupt")
+			fmt.Fprintf(os.Stdout, "error: %v\n", err)
+		})
 	}
 
 	c, m, err := authedClient(ctx)
 	if err != nil {
-		return emitJSON(map[string]any{"status": "session_invalid", "uid": s.UID})
+		return emit(map[string]any{"status": "session_invalid", "uid": s.UID}, func() {
+			fmt.Fprintln(os.Stdout, "status: session invalid")
+			fmt.Fprintf(os.Stdout, "uid: %s\n", s.UID)
+		})
 	}
 	defer c.Close()
 	defer m.Close()
 
 	user, err := c.GetUser(ctx)
 	if err != nil {
-		return emitJSON(map[string]any{"status": "session_invalid", "uid": s.UID})
+		return emit(map[string]any{"status": "session_invalid", "uid": s.UID}, func() {
+			fmt.Fprintln(os.Stdout, "status: session invalid")
+			fmt.Fprintf(os.Stdout, "uid: %s\n", s.UID)
+		})
 	}
 
-	return emitJSON(map[string]any{
+	return emit(map[string]any{
 		"status":       "ok",
 		"uid":          s.UID,
 		"display_name": user.DisplayName,
+	}, func() {
+		fmt.Fprintln(os.Stdout, "status: ok")
+		fmt.Fprintf(os.Stdout, "uid: %s\n", s.UID)
+		fmt.Fprintf(os.Stdout, "display name: %s\n", user.DisplayName)
 	})
 }

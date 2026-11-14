@@ -84,6 +84,7 @@ func summarize(m proton.MessageMetadata) mailSummary {
 
 func cmdMailList(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mail list", flag.ContinueOnError)
+	addJSONFlag(fs)
 	label := fs.String("label", "", "filter by label ID (e.g. 0=inbox, 1=all mail, 5=sent)")
 	unreadOnly := fs.Bool("unread", false, "only unread messages")
 	subject := fs.String("subject", "", "filter: subject contains (case-insensitive, client-side)")
@@ -136,7 +137,7 @@ func cmdMailList(ctx context.Context, args []string) error {
 			}
 			out = append(out, summarize(mm))
 			if limit > 0 && len(out) >= limit {
-				return emitJSON(out)
+				return emit(out, func() { printMailList(out) })
 			}
 		}
 		if len(metas) < mailPageSize {
@@ -144,11 +145,12 @@ func cmdMailList(ctx context.Context, args []string) error {
 		}
 	}
 
-	return emitJSON(out)
+	return emit(out, func() { printMailList(out) })
 }
 
 func cmdMailRead(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mail read", flag.ContinueOnError)
+	addJSONFlag(fs)
 	decrypt := fs.Bool("decrypt", false, "decrypt the body (reads account password from stdin)")
 	noDaemon := fs.Bool("no-daemon", false, "do not use the daemon; always prompt for the account password")
 	downloadAtt := fs.Bool("download-attachments", false, "download attachments (decrypted) into a directory; requires --decrypt")
@@ -281,11 +283,12 @@ func cmdMailRead(ctx context.Context, args []string) error {
 		out["body_hint"] = "re-run with --decrypt to read the encrypted body"
 	}
 
-	return emitJSON(out)
+	return emit(out, func() { printMailRead(out) })
 }
 
 func cmdMailSend(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mail send", flag.ContinueOnError)
+	addJSONFlag(fs)
 	to := fs.String("to", "", "recipient address, comma-separated for several (required)")
 	cc := fs.String("cc", "", "cc addresses, comma-separated")
 	subject := fs.String("subject", "", "subject (required)")
@@ -440,7 +443,9 @@ func cmdMailSend(ctx context.Context, args []string) error {
 		return fmt.Errorf("send draft %s: %w", draft.ID, err)
 	}
 
-	return emitJSON(map[string]string{"status": "sent", "id": sent.ID})
+	return emit(map[string]string{"status": "sent", "id": sent.ID}, func() {
+		fmt.Fprintf(os.Stdout, "sent (id: %s)\n", sent.ID)
+	})
 }
 
 // defaultSender picks the sending address: the first address that can
