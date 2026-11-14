@@ -247,7 +247,11 @@ type daemon struct {
 	// calKR caches the unlocked calendar keyring per calendar ID,
 	// unlocked on first use from the held address keyring.
 	calKR map[string]*crypto.KeyRing
-	calMu sync.Mutex
+	// verifyKR caches the signature-verification keyring per calendar
+	// ID: the held address keys plus the other members' public keys
+	// (see buildVerificationKeyring). Guarded by calMu with calKR.
+	verifyKR map[string]*crypto.KeyRing
+	calMu    sync.Mutex
 
 	// mu guards client and the tracked tokens. mgr is set once at
 	// construction and never swapped, so it needs no guard.
@@ -278,6 +282,7 @@ func newDaemon(c *proton.Client, m *proton.Manager, auth proton.Auth, addrKR *cr
 	d := &daemon{
 		addrKR:        addrKR,
 		calKR:         make(map[string]*crypto.KeyRing),
+		verifyKR:      make(map[string]*crypto.KeyRing),
 		client:        c,
 		mgr:           m,
 		uid:           auth.UID,
@@ -483,6 +488,23 @@ func (d *daemon) unlockCalendarKeyring(ctx context.Context, c *proton.Client, ca
 	return calKR, nil
 }
 
+// verificationKeyring returns the signature-verification keyring for
+// calendarID, building (and caching) it on first use. It wraps
+// buildVerificationKeyring around the held address keyring.
+func (d *daemon) verificationKeyring(ctx context.Context, c *proton.Client, calendarID string) (*crypto.KeyRing, error) {
+	d.calMu.Lock()
+	defer d.calMu.Unlock()
+	if kr, ok := d.verifyKR[calendarID]; ok {
+		return kr, nil
+	}
+	kr, err := buildVerificationKeyring(ctx, c, calendarID, d.addrKR)
+	if err != nil {
+		return nil, err
+	}
+	d.verifyKR[calendarID] = kr
+	return kr, nil
+}
+
 // handleRequest serves one daemon request. The second return value
 // reports whether the daemon should shut down after replying.
 func (d *daemon) handleRequest(ctx context.Context, req daemonRequest) (daemonResponse, bool) {
@@ -542,7 +564,14 @@ func (d *daemon) handleRequest(ctx context.Context, req daemonRequest) (daemonRe
 		if err != nil {
 			return daemonResponse{Error: fmt.Sprintf("unlock calendar keys: %v", err)}, false
 		}
-		summary, location, description, err := decryptEventDetails(req.Event, calKR, d.addrKR)
+		verifyKR, err := d.verificationKeyring(ctx, d.getClient(), req.CalendarID)
+		if err != nil {
+			// Fall back to the bare address keyring: this account's
+			// own events still decrypt.
+			fmt.Fprintf(os.Stderr, "daemon: calendar %s: verification keyring: %v (own events only)\n", req.CalendarID, err)
+			verifyKR = d.addrKR
+		}
+		summary, location, description, err := decryptEventDetails(req.Event, calKR, verifyKR)
 		if err != nil {
 			return daemonResponse{Error: fmt.Sprintf("decrypt event: %v", err)}, false
 		}
@@ -667,10 +696,17 @@ func (d *daemon) buildICSFeed(ctx context.Context) (string, error) {
 			fmt.Fprintf(os.Stderr, "daemon: calendar %s: %v (skipped)\n", r.cal.ID, err)
 			continue
 		}
+		verifyKR, err := d.verificationKeyring(ctx, c, r.cal.ID)
+		if err != nil {
+			// Fall back to the bare address keyring: the feed still
+			// includes this account's own events.
+			fmt.Fprintf(os.Stderr, "daemon: calendar %s: verification keyring: %v (own events only)\n", r.cal.ID, err)
+			verifyKR = d.addrKR
+		}
 		for _, ev := range r.evs {
 			// The server may ignore Begin/End; filter locally too.
 			if ev.StartTime < to.Unix() && ev.EndTime > from.Unix() {
-				summary, location, description, err := decryptEventDetails(&ev, calKR, d.addrKR)
+				summary, location, description, err := decryptEventDetails(&ev, calKR, verifyKR)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "daemon: event %s: decrypt failed: %v (skipped)\n", ev.ID, err)
 					continue

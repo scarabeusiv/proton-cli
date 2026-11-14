@@ -303,7 +303,11 @@ type mockAPI struct {
 	events    []map[string]any // paged by 100, in order
 	user      map[string]any
 	addresses []map[string]any
-	messages  []map[string]any
+	members   []map[string]any
+	// memberPubKeys maps a member email to the armored public key
+	// served by GET /core/v4/keys.
+	memberPubKeys map[string]string
+	messages      []map[string]any
 	// currentRefresh/currentAccess are the tokens the rotating mock
 	// currently accepts. Tests seed them and the session file alike.
 	currentRefresh string
@@ -390,6 +394,8 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]any{"Code": 1000, "Calendars": m.calendars})
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/calendar/v1/") && strings.HasSuffix(r.URL.Path, "/members"):
+		writeJSON(w, map[string]any{"Code": 1000, "Members": m.members})
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/calendar/v1/") && strings.HasSuffix(r.URL.Path, "/events"):
 		if m.rotatingRefresh && !m.validAccess(r) {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -447,6 +453,15 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]any{"Code": 1000, "Addresses": m.addresses})
+	case r.Method == http.MethodGet && r.URL.Path == "/core/v4/keys":
+		email := r.URL.Query().Get("Email")
+		pub, ok := m.memberPubKeys[email]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, `{\"Code\":404,\"Error\":\"no public key for %s\"}`, email)
+			return
+		}
+		writeJSON(w, map[string]any{"Code": 1000, "Keys": []map[string]any{{"Flags": 1, "PublicKey": pub}}, "RecipientType": 1})
 	case r.Method == http.MethodPost && r.URL.Path == "/mail/v4/messages":
 		// Serves both the count request (Limit 0) and the page
 		// request: the count reader only looks at Total, the page
@@ -799,6 +814,39 @@ func testEncryptedMockEvent(t *testing.T, kr *crypto.KeyRing, id string, start, 
 	}
 }
 
+// testSignedMockEvent builds an event whose shared part is encrypted
+// with kr (the calendar keyring) and signed by signerKR (another
+// member's key): a shared-calendar event authored by someone else.
+// Type 3 = encrypted + signed. The signature is over the plaintext,
+// as Decode verifies it after decrypting.
+func testSignedMockEvent(t *testing.T, kr, signerKR *crypto.KeyRing, id string, start, end int64, fullDay bool, ical, author string) map[string]any {
+	t.Helper()
+	armored := testEncryptArmor(t, kr, ical)
+	sig, err := signerKR.SignDetached(crypto.NewPlainMessageFromString(ical))
+	if err != nil {
+		t.Fatalf("SignDetached: %v", err)
+	}
+	sigArmored, err := sig.GetArmored()
+	if err != nil {
+		t.Fatalf("signature GetArmored: %v", err)
+	}
+	fd := 0
+	if fullDay {
+		fd = 1
+	}
+	return map[string]any{
+		"ID":              id,
+		"CalendarID":      "cal1",
+		"StartTime":       start,
+		"EndTime":         end,
+		"FullDay":         fd,
+		"SharedKeyPacket": "",
+		"SharedEvents": []map[string]any{
+			{"Type": 3, "Data": armored, "MemberID": "", "Signature": sigArmored, "Author": author},
+		},
+	}
+}
+
 // testDaemonWithMockAPI builds a daemon whose client points at the mock
 // API and whose calendar keyring cache holds kr for cal1, so decrypts
 // of the mock events succeed without any real Proton credentials.
@@ -871,6 +919,56 @@ func TestIntegrationDaemonICSFeed(t *testing.T) {
 	// The timed event uses DATETIME, not DATE.
 	if !strings.Contains(feed, "DTSTART:"+time.Unix(now.Add(1*time.Hour).Unix(), 0).UTC().Format("20060102T150405Z")) {
 		t.Errorf("ICS feed timed event missing DATETIME DTSTART in:\n%s", feed)
+	}
+}
+
+func TestIntegrationDaemonSharedCalendarMemberDecrypt(t *testing.T) {
+	// A shared-calendar event authored (signed) by another member must
+	// decrypt in the ICS feed: the verification keyring adds the
+	// member's public key, so the signature verifies. Without that,
+	// the event is skipped with "signature made by unknown entity".
+	kr := testKeyRing(t)
+	memberKR := testKeyRing(t)
+	memberPub, err := memberKR.GetKeys()[0].GetArmoredPublicKey()
+	if err != nil {
+		t.Fatalf("member public key: %v", err)
+	}
+	now := time.Now()
+	ev := testSignedMockEvent(t, kr, memberKR, "ev-shared",
+		now.Add(1*time.Hour).Unix(), now.Add(2*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Shared Dinner\nLOCATION:Hana's\nEND:VEVENT", "hana@example.com")
+	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{ev},
+		addresses: []map[string]any{{"ID": "addr1", "Email": "test@example.com"}},
+		members: []map[string]any{
+			{"ID": "m1", "Email": "test@example.com"},
+			{"ID": "m2", "Email": "hana@example.com"},
+		},
+		memberPubKeys: map[string]string{"hana@example.com": memberPub},
+	}
+	newMockAPI(t, m)
+
+	d := testDaemonWithMockAPI(t, kr)
+	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/calendar.ics")
+	if err != nil {
+		t.Fatalf("GET /calendar.ics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /calendar.ics status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read feed: %v", err)
+	}
+	feed := string(body)
+	if !strings.Contains(feed, "SUMMARY:Shared Dinner") {
+		t.Errorf("ICS feed missing the member-signed event in:\n%s", feed)
+	}
+	if !strings.Contains(feed, "LOCATION:Hana's") {
+		t.Errorf("ICS feed missing the member-signed event location in:\n%s", feed)
 	}
 }
 
