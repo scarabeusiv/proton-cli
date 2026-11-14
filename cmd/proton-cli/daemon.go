@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -96,6 +95,7 @@ type daemonResponse struct {
 	OK          bool   `json:"ok"`
 	Running     bool   `json:"running,omitempty"`
 	ICSPort     int    `json:"ics_port,omitempty"`
+	ICSEnabled  bool   `json:"ics_enabled,omitempty"`
 	Body        string `json:"body,omitempty"`
 	Summary     string `json:"summary,omitempty"`
 	Location    string `json:"location,omitempty"`
@@ -142,14 +142,15 @@ func daemonRoundTrip(req daemonRequest) (daemonResponse, error) {
 	return resp, nil
 }
 
-// pingDaemon reports whether a daemon is running and its ICS port.
-// It returns running=false (not an error) when no daemon answers.
-func pingDaemon() (running bool, icsPort int) {
+// pingDaemon reports whether a daemon is running, its ICS port, and
+// whether the ICS feed is enabled. It returns running=false (not an
+// error) when no daemon answers.
+func pingDaemon() (running bool, icsPort int, icsEnabled bool) {
 	resp, err := daemonRoundTrip(daemonRequest{Op: "ping"})
 	if err != nil || !resp.OK {
-		return false, 0
+		return false, 0, false
 	}
-	return resp.Running, resp.ICSPort
+	return resp.Running, resp.ICSPort, resp.ICSEnabled
 }
 
 // daemonDecryptMailBody decrypts an armored mail body via the daemon.
@@ -270,6 +271,18 @@ type daemon struct {
 	icsPort       int
 	icsPastDays   int
 	icsFutureDays int
+
+	// icsMu guards icsEnabled, icsCache, icsCacheOrder, icsCacheReady,
+	// icsCacheUpdated and icsRefreshStop. The cache holds the raw
+	// calendar events exactly as Proton returns them, still encrypted;
+	// nothing decrypted is ever stored there (see ics_cache.go).
+	icsMu           sync.Mutex
+	icsEnabled      bool
+	icsCache        map[string][]proton.CalendarEvent
+	icsCacheOrder   []string
+	icsCacheReady   bool
+	icsCacheUpdated time.Time
+	icsRefreshStop  chan struct{}
 
 	listener net.Listener
 	httpSrv  *http.Server
@@ -549,7 +562,13 @@ func (d *daemon) verificationKeyring(ctx context.Context, c *proton.Client, cale
 func (d *daemon) handleRequest(ctx context.Context, req daemonRequest) (daemonResponse, bool) {
 	switch req.Op {
 	case "ping":
-		return daemonResponse{OK: true, Running: true, ICSPort: d.icsPort}, false
+		return daemonResponse{OK: true, Running: true, ICSPort: d.icsPort, ICSEnabled: d.icsIsEnabled()}, false
+	case "ics_enable":
+		d.setICSEnabled(true)
+		return daemonResponse{OK: true, ICSPort: d.icsPort, ICSEnabled: true}, false
+	case "ics_disable":
+		d.setICSEnabled(false)
+		return daemonResponse{OK: true, ICSEnabled: false}, false
 	case "stop":
 		return daemonResponse{OK: true}, true
 	case "access_token":
@@ -668,81 +687,51 @@ func (d *daemon) buildICSFeedWithRetry(ctx context.Context) (string, error) {
 	return d.buildICSFeed(ctx)
 }
 
-// buildICSFeed fetches every calendar's events in the feed window and
-// decrypts them with the held keyrings. It fetches fresh on every call,
-// so a subscribing calendar sees current data on its next poll. A fetch
-// failure is an error (the handler serves 503, never a stale feed); an
-// individual event that fails to decrypt is skipped, not fatal.
-// Calendars are fetched concurrently (each calendar's pages are
-// fetched in parallel batches too — see listCalendarEvents): the
-// server returns the whole calendar per calendar, so fetching
-// calendars one at a time doubles the feed time. Decryption stays
-// sequential, after the fetch, so keyrings are never shared across
-// goroutines. Results are collected in calendar order, so the feed
-// is deterministic.
+// buildICSFeed builds the feed from the encrypted-events cache. It
+// decrypts the cached (still-encrypted) events with the held keyrings
+// on every call, so the feed is always generated fresh and nothing
+// decrypted is stored. ICS must be enabled and the cache warm;
+// otherwise it returns an error (the handler serves 503) rather than
+// doing a slow on-demand full fetch. Calendars are served in the
+// cache's fetch order, so the feed is deterministic.
 // The ctx is the detached fetch context from handleICSFeed, not the
-// HTTP request context, so a client disconnect cannot cancel the fetch.
-// The whole build uses one client snapshot, so a client swap mid-build
-// cannot mix tokens within a single feed.
+// HTTP request context, so a client disconnect cannot cancel the
+// keyring lookups. The whole build uses one client snapshot, so a
+// client swap mid-build cannot mix tokens within a single feed.
 func (d *daemon) buildICSFeed(ctx context.Context) (string, error) {
-	c := d.getClient()
-	cals, err := c.GetCalendars(ctx)
-	if err != nil {
-		return "", fmt.Errorf("list calendars: %w", err)
+	if !d.icsIsEnabled() {
+		return "", errors.New("ICS is not enabled (run `proton-cli daemon ics enable`)")
 	}
+	snapshot, order, ready := d.icsCacheSnapshot()
+	if !ready {
+		return "", errors.New("ICS cache is warming up, try again shortly")
+	}
+	c := d.getClient()
 	now := time.Now()
 	from := now.AddDate(0, 0, -d.icsPastDays)
 	to := now.AddDate(0, 0, d.icsFutureDays)
-	filter := url.Values{
-		"Begin": []string{strconv.FormatInt(from.Unix(), 10)},
-		"End":   []string{strconv.FormatInt(to.Unix(), 10)},
-	}
-	// Fetch every calendar's events concurrently. Each goroutine
-	// writes only its own slot, so no synchronisation is needed
-	// beyond the WaitGroup.
-	type calEvents struct {
-		cal proton.Calendar
-		evs []proton.CalendarEvent
-		err error
-	}
-	fetched := make([]calEvents, len(cals))
-	var wg sync.WaitGroup
-	for i, cal := range cals {
-		wg.Add(1)
-		go func(i int, cal proton.Calendar) {
-			defer wg.Done()
-			first, err := c.GetCalendarEvents(ctx, cal.ID, 0, calendarPageSize, filter)
-			if err != nil {
-				fetched[i] = calEvents{cal: cal, err: fmt.Errorf("list events for calendar %s: %w", cal.ID, err)}
-				return
-			}
-			evs, err := listCalendarEvents(ctx, c, cal.ID, filter, first)
-			if err != nil {
-				fetched[i] = calEvents{cal: cal, err: fmt.Errorf("list events for calendar %s: %w", cal.ID, err)}
-				return
-			}
-			fetched[i] = calEvents{cal: cal, evs: evs}
-		}(i, cal)
-	}
-	wg.Wait()
 	var events []icsEvent
-	for _, r := range fetched {
-		if r.err != nil {
-			return "", r.err
-		}
-		calKR, err := d.calendarKeyring(ctx, c, r.cal.ID)
+	for _, calID := range order {
+		evs := snapshot[calID]
+		calKR, err := d.calendarKeyring(ctx, c, calID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "daemon: calendar %s: %v (skipped)\n", r.cal.ID, err)
+			if isInvalidRefreshToken(err) {
+				return "", err
+			}
+			fmt.Fprintf(os.Stderr, "daemon: calendar %s: %v (skipped)\n", calID, err)
 			continue
 		}
-		verifyKR, err := d.verificationKeyring(ctx, c, r.cal.ID, collectAuthorEmails(r.evs))
+		verifyKR, err := d.verificationKeyring(ctx, c, calID, collectAuthorEmails(evs))
 		if err != nil {
+			if isInvalidRefreshToken(err) {
+				return "", err
+			}
 			// Fall back to the bare address keyring: the feed still
 			// includes this account's own events.
-			fmt.Fprintf(os.Stderr, "daemon: calendar %s: verification keyring: %v (own events only)\n", r.cal.ID, err)
+			fmt.Fprintf(os.Stderr, "daemon: calendar %s: verification keyring: %v (own events only)\n", calID, err)
 			verifyKR = d.addrKR
 		}
-		for _, ev := range r.evs {
+		for _, ev := range evs {
 			// The server may ignore Begin/End; filter locally too.
 			if ev.StartTime < to.Unix() && ev.EndTime > from.Unix() {
 				summary, location, description, err := decryptEventDetails(&ev, calKR, verifyKR)
@@ -765,14 +754,16 @@ func (d *daemon) buildICSFeed(ctx context.Context) (string, error) {
 	return icsFeed(events, now), nil
 }
 
-// handleICSFeed serves the read-only feed. A fetch failure is a 503
-// with a plain error, never a stale feed.
+// handleICSFeed serves the read-only feed from the encrypted-events
+// cache (see ics_cache.go). A failure is a 503 with a plain error,
+// never a stale feed; ICS being disabled or the cache still warming
+// up are 503s too, not a slow on-demand fetch.
 //
-// The fetch is detached from the HTTP request context: it runs on a
+// The build runs detached from the HTTP request context: it runs on a
 // background context with icsFetchTimeout, so a subscribing calendar
-// that gives up (or times out) mid-fetch cannot cancel the in-flight
-// Proton API calls. The feed is still generated fresh on every
-// request and discarded afterwards — nothing decrypted is cached.
+// that gives up (or times out) cannot cancel it. The feed is
+// generated fresh from the cached encrypted events on every request
+// and discarded afterwards — nothing decrypted is cached.
 func (d *daemon) handleICSFeed(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -840,6 +831,7 @@ func cmdDaemonStart(ctx context.Context, args []string) error {
 	icsPort := fs.Int("ics-port", defaultICSPort, "port for the read-only ICS feed on 127.0.0.1")
 	icsPast := fs.Int("ics-days-past", defaultICSDaysPast, "days of past events in the ICS feed")
 	icsFuture := fs.Int("ics-days-future", defaultICSDaysFuture, "days of future events in the ICS feed")
+	ics := fs.Bool("ics", false, "enable the read-only ICS feed (encrypted-events cache + background refresh; off by default)")
 	foreground := fs.Bool("foreground", false, "stay in the foreground instead of backgrounding after the prompt")
 	daemonized := fs.Bool("daemonized", false, "internal: run as the backgrounded daemon child (do not use directly)")
 	if err := fs.Parse(args); err != nil {
@@ -853,7 +845,7 @@ func cmdDaemonStart(ctx context.Context, args []string) error {
 	}
 
 	if *daemonized {
-		return cmdDaemonStartChild(ctx, *icsPort, *icsPast, *icsFuture)
+		return cmdDaemonStartChild(ctx, *icsPort, *icsPast, *icsFuture, *ics)
 	}
 
 	sockPath, err := daemonSocketPath()
@@ -861,7 +853,7 @@ func cmdDaemonStart(ctx context.Context, args []string) error {
 		return err
 	}
 	if _, err := os.Stat(sockPath); err == nil {
-		if running, _ := pingDaemon(); running {
+		if running, _, _ := pingDaemon(); running {
 			return fmt.Errorf("daemon is already running (socket %s)", sockPath)
 		}
 		// Stale socket: the previous daemon died without removing it.
@@ -923,7 +915,11 @@ func cmdDaemonStart(ctx context.Context, args []string) error {
 	}
 
 	if *foreground {
-		return runDaemon(newDaemon(c, m, auth, addrKR, *icsPort, *icsPast, *icsFuture), sockPath)
+		d := newDaemon(c, m, auth, addrKR, *icsPort, *icsPast, *icsFuture)
+		if *ics {
+			d.setICSEnabled(true)
+		}
+		return runDaemon(d, sockPath)
 	}
 
 	logPath, err := daemonLogPath()
@@ -932,13 +928,17 @@ func cmdDaemonStart(ctx context.Context, args []string) error {
 		m.Close()
 		return err
 	}
-	pid, err := spawnDaemonChild(salted, *icsPort, *icsPast, *icsFuture, logPath)
+	pid, err := spawnDaemonChild(salted, *icsPort, *icsPast, *icsFuture, *ics, logPath)
 	c.Close()
 	m.Close()
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "daemon started (PID %d, socket %s)\nICS feed: http://127.0.0.1:%d/calendar.ics\nLog: %s\n", pid, sockPath, *icsPort, logPath)
+	if *ics {
+		fmt.Fprintf(os.Stderr, "daemon started (PID %d, socket %s)\nICS feed: http://127.0.0.1:%d/calendar.ics\nLog: %s\n", pid, sockPath, *icsPort, logPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "daemon started (PID %d, socket %s)\nICS feed: disabled (run `proton-cli daemon ics enable` to enable it)\nLog: %s\n", pid, sockPath, logPath)
+	}
 	return nil
 }
 
@@ -946,7 +946,7 @@ func cmdDaemonStart(ctx context.Context, args []string) error {
 // salted key password from the anonymous pipe (fd 3) the parent
 // passed, unlocks the keyring, and serves. It never prompts: a missing
 // or empty pipe is a fatal startup error (logged to the daemon log).
-func cmdDaemonStartChild(ctx context.Context, icsPort, icsPast, icsFuture int) error {
+func cmdDaemonStartChild(ctx context.Context, icsPort, icsPast, icsFuture int, ics bool) error {
 	pipe := os.NewFile(3, "daemon-pipe")
 	salted, err := io.ReadAll(pipe)
 	_ = pipe.Close()
@@ -978,7 +978,11 @@ func cmdDaemonStartChild(ctx context.Context, icsPort, icsPast, icsFuture int) e
 		m.Close()
 		return err
 	}
-	return runDaemon(newDaemon(c, m, auth, addrKR, icsPort, icsPast, icsFuture), sockPath)
+	d := newDaemon(c, m, auth, addrKR, icsPort, icsPast, icsFuture)
+	if ics {
+		d.setICSEnabled(true)
+	}
+	return runDaemon(d, sockPath)
 }
 
 // spawnDaemonChild re-execs this binary as a detached daemon child,
@@ -992,7 +996,7 @@ func cmdDaemonStartChild(ctx context.Context, icsPort, icsPast, icsFuture int) e
 // talk to the daemon over its socket, so passing the already-derived
 // salted password (which unlocks keys but cannot log in to Proton)
 // over the pipe is within the accepted threat model.
-func spawnDaemonChild(salted []byte, icsPort, icsPast, icsFuture int, logPath string) (int, error) {
+func spawnDaemonChild(salted []byte, icsPort, icsPast, icsFuture int, ics bool, logPath string) (int, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return 0, err
@@ -1011,7 +1015,8 @@ func spawnDaemonChild(salted []byte, icsPort, icsPast, icsFuture int, logPath st
 	cmd := exec.Command(exe, "daemon", "start", "--daemonized",
 		"--ics-port", strconv.Itoa(icsPort),
 		"--ics-days-past", strconv.Itoa(icsPast),
-		"--ics-days-future", strconv.Itoa(icsFuture))
+		"--ics-days-future", strconv.Itoa(icsFuture),
+		"--ics", strconv.FormatBool(ics))
 	cmd.ExtraFiles = []*os.File{r}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -1041,7 +1046,7 @@ func spawnDaemonChild(salted []byte, icsPort, icsPast, icsFuture int, logPath st
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if running, _ := pingDaemon(); running {
+		if running, _, _ := pingDaemon(); running {
 			return cmd.Process.Pid, nil
 		}
 		select {
@@ -1104,7 +1109,11 @@ func runDaemon(d *daemon, sockPath string) error {
 		}
 	}()
 
-	fmt.Fprintf(os.Stderr, "daemon started (socket %s)\nICS feed: http://127.0.0.1:%d/calendar.ics\n", sockPath, d.icsPort)
+	if d.icsIsEnabled() {
+		fmt.Fprintf(os.Stderr, "daemon started (socket %s)\nICS feed: http://127.0.0.1:%d/calendar.ics\n", sockPath, d.icsPort)
+	} else {
+		fmt.Fprintf(os.Stderr, "daemon started (socket %s)\nICS feed: disabled (run `proton-cli daemon ics enable` to enable it)\n", sockPath)
+	}
 
 	// Shut down on SIGINT/SIGTERM or on a `daemon stop` request.
 	sigCh := make(chan os.Signal, 1)
@@ -1179,7 +1188,7 @@ func isTestBinary(exe string) bool {
 // use never hangs waiting for a password that can never arrive.
 // --no-daemon callers must not call this at all.
 func ensureDaemonForDecrypt() bool {
-	if running, _ := pingDaemon(); running {
+	if running, _, _ := pingDaemon(); running {
 		return true
 	}
 	if !stdinIsTTY() {
@@ -1206,7 +1215,7 @@ func ensureDaemonForDecrypt() bool {
 	if err := cmd.Run(); err != nil {
 		return false
 	}
-	running, _ := pingDaemon()
+	running, _, _ := pingDaemon()
 	return running
 }
 
@@ -1217,9 +1226,9 @@ func cmdDaemonStatus(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	running, icsPort := pingDaemon()
-	out := map[string]any{"running": running}
-	if running {
+	running, icsPort, icsEnabled := pingDaemon()
+	out := map[string]any{"running": running, "ics_enabled": icsEnabled}
+	if running && icsEnabled {
 		out["ics_url"] = fmt.Sprintf("http://127.0.0.1:%d/calendar.ics", icsPort)
 	}
 	return emit(out, func() {
@@ -1228,21 +1237,43 @@ func cmdDaemonStatus(ctx context.Context, args []string) error {
 			return
 		}
 		fmt.Fprintln(os.Stdout, "daemon: running")
-		fmt.Fprintf(os.Stdout, "ICS feed: %s\n", out["ics_url"])
+		if icsEnabled {
+			fmt.Fprintf(os.Stdout, "ICS feed: %s\n", out["ics_url"])
+		} else {
+			fmt.Fprintln(os.Stdout, "ICS: disabled (run `proton-cli daemon ics enable` to enable it)")
+		}
 	})
 }
 
 // cmdDaemonICS prints the feed URL and the Apple Calendar subscription
-// steps. The daemon must be running: the feed exists only while it
-// holds the keyrings in memory.
+// steps, or enables/disables the feed on a running daemon
+// (`daemon ics enable` / `daemon ics disable`). The daemon must be
+// running for the bare form: the feed exists only while it holds the
+// keyrings in memory. Enabling on a stopped daemon starts one with
+// ICS enabled instead (equivalent to `daemon start --ics`).
 func cmdDaemonICS(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("daemon ics", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	running, icsPort := pingDaemon()
+	if rest := fs.Args(); len(rest) > 0 {
+		switch rest[0] {
+		case "enable":
+			return cmdDaemonICSEnable(ctx)
+		case "disable":
+			return cmdDaemonICSDisable(ctx)
+		default:
+			return fmt.Errorf("unknown daemon ics subcommand %q (enable|disable)", rest[0])
+		}
+	}
+	running, icsPort, icsEnabled := pingDaemon()
 	if !running {
 		return fmt.Errorf("daemon is not running — start it with `proton-cli daemon start` first")
+	}
+	if !icsEnabled {
+		fmt.Fprintln(os.Stdout, "ICS is not enabled.")
+		fmt.Fprintln(os.Stdout, "Run `proton-cli daemon ics enable` to enable the ICS feed (it builds the encrypted-events cache in the background).")
+		return nil
 	}
 	url := fmt.Sprintf("http://127.0.0.1:%d/calendar.ics", icsPort)
 	fmt.Fprintf(os.Stdout, "ICS feed: %s\n\n", url)
@@ -1251,5 +1282,42 @@ func cmdDaemonICS(ctx context.Context, args []string) error {
 The feed is read-only and refreshes periodically; it is served only while
 the daemon is running (start it with 'proton-cli daemon start').
 `)
+	return nil
+}
+
+// cmdDaemonICSEnable enables the ICS feed on the running daemon. If no
+// daemon is running, it starts one with ICS enabled (equivalent to
+// `daemon start --ics`, prompting once for the account password).
+func cmdDaemonICSEnable(ctx context.Context) error {
+	if running, _, _ := pingDaemon(); running {
+		resp, err := daemonRoundTrip(daemonRequest{Op: "ics_enable"})
+		if err != nil {
+			return err
+		}
+		if !resp.OK {
+			return fmt.Errorf("enable ICS: %s", resp.Error)
+		}
+		fmt.Fprintf(os.Stderr, "ICS enabled\nICS feed: http://127.0.0.1:%d/calendar.ics\n", resp.ICSPort)
+		fmt.Fprintln(os.Stderr, "The encrypted-events cache is building in the background; wait for the \"ICS cache ready\" line in the daemon log before adding the calendar.")
+		return nil
+	}
+	return cmdDaemonStart(ctx, []string{"--ics"})
+}
+
+// cmdDaemonICSDisable disables the ICS feed on the running daemon
+// (stops the background refresh, clears the in-memory cache). The
+// daemon itself keeps running.
+func cmdDaemonICSDisable(ctx context.Context) error {
+	if running, _, _ := pingDaemon(); !running {
+		return fmt.Errorf("daemon is not running")
+	}
+	resp, err := daemonRoundTrip(daemonRequest{Op: "ics_disable"})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("disable ICS: %s", resp.Error)
+	}
+	fmt.Fprintln(os.Stderr, "ICS disabled (cache cleared)")
 	return nil
 }

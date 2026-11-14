@@ -37,6 +37,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -867,6 +868,25 @@ func testDaemonWithMockAPI(t *testing.T, kr *crypto.KeyRing) *daemon {
 	return d
 }
 
+// enableTestDaemonICS enables ICS on a test daemon and waits for the
+// cache to be ready (first background fetch done). It registers a
+// cleanup that disables ICS (stopping the refresh loop).
+func enableTestDaemonICS(t *testing.T, d *daemon) {
+	t.Helper()
+	d.setICSEnabled(true)
+	t.Cleanup(func() { d.setICSEnabled(false) })
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, _, ready := d.icsCacheSnapshot(); ready {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ICS cache did not become ready within 10s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func TestIntegrationDaemonICSFeed(t *testing.T) {
 	kr := testKeyRing(t)
 	now := time.Now()
@@ -882,6 +902,7 @@ func TestIntegrationDaemonICSFeed(t *testing.T) {
 	newMockAPI(t, m)
 
 	d := testDaemonWithMockAPI(t, kr)
+	enableTestDaemonICS(t, d)
 	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
 	defer srv.Close()
 
@@ -948,6 +969,7 @@ func TestIntegrationDaemonSharedCalendarMemberDecrypt(t *testing.T) {
 	newMockAPI(t, m)
 
 	d := testDaemonWithMockAPI(t, kr)
+	enableTestDaemonICS(t, d)
 	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
 	defer srv.Close()
 
@@ -1009,6 +1031,7 @@ func TestIntegrationDaemonSharedCalendarAuthorDecrypt(t *testing.T) {
 	newMockAPI(t, m)
 
 	d := testDaemonWithMockAPI(t, kr)
+	enableTestDaemonICS(t, d)
 	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
 	defer srv.Close()
 
@@ -1032,9 +1055,13 @@ func TestIntegrationDaemonSharedCalendarAuthorDecrypt(t *testing.T) {
 
 func TestIntegrationDaemonICSFeedFetchFailure(t *testing.T) {
 	// A fetch failure must serve 503 with a plain error, never a stale feed.
+	// ICS is enabled so the background refresh actually attempts the
+	// fetch and fails; the cache never becomes ready, so the feed is 503.
 	m := &mockAPI{t: t, calendarsErr: true}
 	newMockAPI(t, m)
 	d := testDaemonWithMockAPI(t, testKeyRing(t))
+	d.setICSEnabled(true)
+	t.Cleanup(func() { d.setICSEnabled(false) })
 	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
 	defer srv.Close()
 
@@ -1056,52 +1083,206 @@ func TestIntegrationDaemonICSFeedFetchFailure(t *testing.T) {
 }
 
 func TestIntegrationDaemonICSFeedSurvivesCancelledRequest(t *testing.T) {
-	// A cancelled HTTP request context must not cancel the feed fetch:
-	// the handler detaches the fetch onto a background context, so a
-	// subscribing calendar that gives up mid-fetch cannot kill it.
+	// A cancelled HTTP request context must not break the feed: the
+	// feed is served from the encrypted-events cache and the build
+	// runs detached from the request context, so a subscribing
+	// calendar that gives up cannot cancel it.
 	kr := testKeyRing(t)
 	now := time.Now()
 	ev := testEncryptedMockEvent(t, kr, "ev-detach",
 		now.Add(1*time.Hour).Unix(), now.Add(2*time.Hour).Unix(), false,
 		"BEGIN:VEVENT\nSUMMARY:Detach Test\nEND:VEVENT")
-	eventsStarted := make(chan struct{}, 1)
-	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{ev},
-		eventsDelay: 500 * time.Millisecond,
-		onEvents: func() {
-			select {
-			case eventsStarted <- struct{}{}:
-			default:
-			}
-		}}
+	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{ev}}
 	newMockAPI(t, m)
 
 	d := testDaemonWithMockAPI(t, kr)
+	enableTestDaemonICS(t, d)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodGet, "/calendar.ics", nil).WithContext(ctx)
 	rec := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		d.handleICSFeed(rec, req)
-		close(done)
-	}()
-	// Wait until the mock has seen the events request, so the fetch
-	// is in flight, then cancel the request context.
-	select {
-	case <-eventsStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("mock never received the events request")
-	}
+	// Cancel the request context before the handler runs: the feed
+	// must still be served, because the build is detached from it.
 	cancel()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("handleICSFeed did not return after the request context was cancelled")
-	}
+	d.handleICSFeed(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /calendar.ics after cancel status = %d, want 200", rec.Code)
 	}
 	if !strings.Contains(rec.Body.String(), "UID:ev-detach@proton-cli") {
 		t.Errorf("ICS feed missing the detached event in:\n%s", rec.Body.String())
+	}
+}
+func TestIntegrationDaemonICSFeedServedFromCache(t *testing.T) {
+	// The feed is served from the encrypted-events cache: after the
+	// cache is warm, feed requests do not hit Proton again, and the
+	// cached events stay encrypted (decrypting a feed must not mutate
+	// the cache).
+	kr := testKeyRing(t)
+	now := time.Now()
+	timed := testEncryptedMockEvent(t, kr, "ev-cache",
+		now.Add(1*time.Hour).Unix(), now.Add(2*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Cache Test\nLOCATION:Room 9\nEND:VEVENT")
+	tomorrow := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+	day := testEncryptedMockEvent(t, kr, "ev-cache-day",
+		tomorrow.Unix(), tomorrow.Add(24*time.Hour).Unix(), true,
+		"BEGIN:VEVENT\nSUMMARY:Cache Day\nEND:VEVENT")
+	var eventFetches atomic.Int64
+	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{timed, day},
+		onEvents: func() { eventFetches.Add(1) }}
+	newMockAPI(t, m)
+
+	d := testDaemonWithMockAPI(t, kr)
+	enableTestDaemonICS(t, d)
+	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
+	defer srv.Close()
+
+	getFeed := func() string {
+		resp, err := http.Get(srv.URL + "/calendar.ics")
+		if err != nil {
+			t.Fatalf("GET /calendar.ics: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /calendar.ics status = %d, want 200", resp.StatusCode)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read feed: %v", err)
+		}
+		return string(body)
+	}
+
+	// The cache build fetched the events once (one page for cal1).
+	if got := eventFetches.Load(); got != 1 {
+		t.Fatalf("event fetches after cache ready = %d, want 1", got)
+	}
+	feed1 := getFeed()
+	feed2 := getFeed()
+	for _, want := range []string{"SUMMARY:Cache Test", "SUMMARY:Cache Day"} {
+		if !strings.Contains(feed1, want) || !strings.Contains(feed2, want) {
+			t.Errorf("feed missing %q", want)
+		}
+	}
+	// No second Proton fetch for the two feed requests.
+	if got := eventFetches.Load(); got != 1 {
+		t.Errorf("event fetches after two feed requests = %d, want 1 (feed must come from the cache)", got)
+	}
+	// The cached events are still encrypted: no part holds plaintext.
+	d.icsMu.Lock()
+	cached := d.icsCache["cal1"]
+	d.icsMu.Unlock()
+	for _, ev := range cached {
+		for _, parts := range [][]proton.CalendarEventPart{ev.SharedEvents, ev.CalendarEvents, ev.PersonalEvents, ev.AttendeesEvents} {
+			for _, part := range parts {
+				if strings.Contains(part.Data, "Cache Test") || strings.Contains(part.Data, "Cache Day") {
+					t.Errorf("cached event %s part.Data holds decrypted text; the cache must stay encrypted", ev.ID)
+				}
+			}
+		}
+	}
+}
+
+func TestIntegrationDaemonICSFeedDisabledByDefault(t *testing.T) {
+	// Without --ics the daemon does not build the cache and does not
+	// serve the feed: a feed request is 503 and Proton is never asked
+	// for events.
+	kr := testKeyRing(t)
+	now := time.Now()
+	ev := testEncryptedMockEvent(t, kr, "ev-off",
+		now.Add(1*time.Hour).Unix(), now.Add(2*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Off Test\nEND:VEVENT")
+	var eventFetches atomic.Int64
+	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{ev},
+		onEvents: func() { eventFetches.Add(1) }}
+	newMockAPI(t, m)
+
+	d := testDaemonWithMockAPI(t, kr)
+	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/calendar.ics")
+	if err != nil {
+		t.Fatalf("GET /calendar.ics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("GET /calendar.ics status = %d, want 503", resp.StatusCode)
+	}
+	if got := eventFetches.Load(); got != 0 {
+		t.Errorf("event fetches with ICS disabled = %d, want 0 (no cache build)", got)
+	}
+	if _, _, ready := d.icsCacheSnapshot(); ready {
+		t.Errorf("cache is ready with ICS disabled")
+	}
+}
+
+func TestIntegrationDaemonICSToggle(t *testing.T) {
+	// ICS can be toggled on a running daemon without restarting it:
+	// enable builds the cache and serves the feed; disable clears the
+	// cache and stops the feed; the daemon itself keeps running.
+	kr := testKeyRing(t)
+	now := time.Now()
+	ev := testEncryptedMockEvent(t, kr, "ev-toggle",
+		now.Add(1*time.Hour).Unix(), now.Add(2*time.Hour).Unix(), false,
+		"BEGIN:VEVENT\nSUMMARY:Toggle Test\nEND:VEVENT")
+	m := &mockAPI{t: t, calendars: testCalendars(), events: []map[string]any{ev}}
+	newMockAPI(t, m)
+
+	d := testDaemonWithMockAPI(t, kr)
+	srv := httptest.NewServer(http.HandlerFunc(d.handleICSFeed))
+	defer srv.Close()
+
+	getFeed := func() (int, string) {
+		resp, err := http.Get(srv.URL + "/calendar.ics")
+		if err != nil {
+			t.Fatalf("GET /calendar.ics: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read feed: %v", err)
+		}
+		return resp.StatusCode, string(body)
+	}
+
+	// ICS off by default: the feed is 503, no cache built.
+	if code, _ := getFeed(); code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /calendar.ics with ICS disabled status = %d, want 503", code)
+	}
+
+	// Enable via the socket op (no restart): the cache builds and the
+	// feed is served.
+	resp, _ := d.handleRequest(context.Background(), daemonRequest{Op: "ics_enable"})
+	if !resp.OK || !resp.ICSEnabled {
+		t.Fatalf("ics_enable op = %+v, want OK with ICSEnabled", resp)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, _, ready := d.icsCacheSnapshot(); ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ICS cache did not become ready after enable")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if code, body := getFeed(); code != http.StatusOK {
+		t.Fatalf("GET /calendar.ics after enable status = %d, want 200", code)
+	} else if !strings.Contains(body, "SUMMARY:Toggle Test") {
+		t.Errorf("ICS feed after enable missing the event in:\n%s", body)
+	}
+
+	// Disable via the socket op: the cache is cleared and the feed
+	// stops (503), with no restart.
+	resp, _ = d.handleRequest(context.Background(), daemonRequest{Op: "ics_disable"})
+	if !resp.OK || resp.ICSEnabled {
+		t.Fatalf("ics_disable op = %+v, want OK without ICSEnabled", resp)
+	}
+	if _, _, ready := d.icsCacheSnapshot(); ready {
+		t.Errorf("cache is still ready after disable")
+	}
+	if code, _ := getFeed(); code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /calendar.ics after disable status = %d, want 503", code)
 	}
 }
 
