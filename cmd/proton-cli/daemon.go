@@ -605,6 +605,13 @@ func (d *daemon) buildICSFeedWithRetry(ctx context.Context) (string, error) {
 // so a subscribing calendar sees current data on its next poll. A fetch
 // failure is an error (the handler serves 503, never a stale feed); an
 // individual event that fails to decrypt is skipped, not fatal.
+// Calendars are fetched concurrently (each calendar's pages are
+// fetched in parallel batches too — see listCalendarEvents): the
+// server returns the whole calendar per calendar, so fetching
+// calendars one at a time doubles the feed time. Decryption stays
+// sequential, after the fetch, so keyrings are never shared across
+// goroutines. Results are collected in calendar order, so the feed
+// is deterministic.
 // The ctx is the detached fetch context from handleICSFeed, not the
 // HTTP request context, so a client disconnect cannot cancel the fetch.
 // The whole build uses one client snapshot, so a client swap mid-build
@@ -622,22 +629,45 @@ func (d *daemon) buildICSFeed(ctx context.Context) (string, error) {
 		"Begin": []string{strconv.FormatInt(from.Unix(), 10)},
 		"End":   []string{strconv.FormatInt(to.Unix(), 10)},
 	}
+	// Fetch every calendar's events concurrently. Each goroutine
+	// writes only its own slot, so no synchronisation is needed
+	// beyond the WaitGroup.
+	type calEvents struct {
+		cal proton.Calendar
+		evs []proton.CalendarEvent
+		err error
+	}
+	fetched := make([]calEvents, len(cals))
+	var wg sync.WaitGroup
+	for i, cal := range cals {
+		wg.Add(1)
+		go func(i int, cal proton.Calendar) {
+			defer wg.Done()
+			first, err := c.GetCalendarEvents(ctx, cal.ID, 0, calendarPageSize, filter)
+			if err != nil {
+				fetched[i] = calEvents{cal: cal, err: fmt.Errorf("list events for calendar %s: %w", cal.ID, err)}
+				return
+			}
+			evs, err := listCalendarEvents(ctx, c, cal.ID, filter, first)
+			if err != nil {
+				fetched[i] = calEvents{cal: cal, err: fmt.Errorf("list events for calendar %s: %w", cal.ID, err)}
+				return
+			}
+			fetched[i] = calEvents{cal: cal, evs: evs}
+		}(i, cal)
+	}
+	wg.Wait()
 	var events []icsEvent
-	for _, cal := range cals {
-		first, err := c.GetCalendarEvents(ctx, cal.ID, 0, calendarPageSize, filter)
-		if err != nil {
-			return "", fmt.Errorf("list events for calendar %s: %w", cal.ID, err)
+	for _, r := range fetched {
+		if r.err != nil {
+			return "", r.err
 		}
-		evs, err := listCalendarEvents(ctx, c, cal.ID, filter, first)
+		calKR, err := d.calendarKeyring(ctx, c, r.cal.ID)
 		if err != nil {
-			return "", fmt.Errorf("list events for calendar %s: %w", cal.ID, err)
-		}
-		calKR, err := d.calendarKeyring(ctx, c, cal.ID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "daemon: calendar %s: %v (skipped)\n", cal.ID, err)
+			fmt.Fprintf(os.Stderr, "daemon: calendar %s: %v (skipped)\n", r.cal.ID, err)
 			continue
 		}
-		for _, ev := range evs {
+		for _, ev := range r.evs {
 			// The server may ignore Begin/End; filter locally too.
 			if ev.StartTime < to.Unix() && ev.EndTime > from.Unix() {
 				summary, location, description, err := decryptEventDetails(&ev, calKR, d.addrKR)
