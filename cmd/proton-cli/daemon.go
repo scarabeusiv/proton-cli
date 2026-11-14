@@ -251,7 +251,12 @@ type daemon struct {
 	// ID: the held address keys plus the other members' public keys
 	// (see buildVerificationKeyring). Guarded by calMu with calKR.
 	verifyKR map[string]*crypto.KeyRing
-	calMu    sync.Mutex
+	// verifyKRauthors records, per calendar ID, the author addresses
+	// whose public keys are already in verifyKR, so a ring built for
+	// one author is rebuilt (not reused) when a new author appears.
+	// Guarded by calMu with verifyKR.
+	verifyKRauthors map[string]map[string]bool
+	calMu           sync.Mutex
 
 	// mu guards client and the tracked tokens. mgr is set once at
 	// construction and never swapped, so it needs no guard.
@@ -280,18 +285,19 @@ type daemon struct {
 // current on every lazy refresh.
 func newDaemon(c *proton.Client, m *proton.Manager, auth proton.Auth, addrKR *crypto.KeyRing, icsPort, icsPast, icsFuture int) *daemon {
 	d := &daemon{
-		addrKR:        addrKR,
-		calKR:         make(map[string]*crypto.KeyRing),
-		verifyKR:      make(map[string]*crypto.KeyRing),
-		client:        c,
-		mgr:           m,
-		uid:           auth.UID,
-		accessToken:   auth.AccessToken,
-		refreshToken:  auth.RefreshToken,
-		icsPort:       icsPort,
-		icsPastDays:   icsPast,
-		icsFutureDays: icsFuture,
-		done:          make(chan struct{}),
+		addrKR:          addrKR,
+		calKR:           make(map[string]*crypto.KeyRing),
+		verifyKR:        make(map[string]*crypto.KeyRing),
+		verifyKRauthors: make(map[string]map[string]bool),
+		client:          c,
+		mgr:             m,
+		uid:             auth.UID,
+		accessToken:     auth.AccessToken,
+		refreshToken:    auth.RefreshToken,
+		icsPort:         icsPort,
+		icsPastDays:     icsPast,
+		icsFutureDays:   icsFuture,
+		done:            make(chan struct{}),
 	}
 	c.AddAuthHandler(d.authHandler)
 	return d
@@ -490,18 +496,51 @@ func (d *daemon) unlockCalendarKeyring(ctx context.Context, c *proton.Client, ca
 
 // verificationKeyring returns the signature-verification keyring for
 // calendarID, building (and caching) it on first use. It wraps
-// buildVerificationKeyring around the held address keyring.
-func (d *daemon) verificationKeyring(ctx context.Context, c *proton.Client, calendarID string) (*crypto.KeyRing, error) {
+// buildVerificationKeyring around the held address keyring, including
+// the public keys of extraAuthors (the authors of the events being
+// decrypted). A cached ring is rebuilt when an author appears that
+// it was not built with, so a new author's events verify too.
+func (d *daemon) verificationKeyring(ctx context.Context, c *proton.Client, calendarID string, extraAuthors []string) (*crypto.KeyRing, error) {
 	d.calMu.Lock()
 	defer d.calMu.Unlock()
-	if kr, ok := d.verifyKR[calendarID]; ok {
-		return kr, nil
+	want := make(map[string]bool, len(extraAuthors))
+	for _, e := range extraAuthors {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e != "" {
+			want[e] = true
+		}
 	}
-	kr, err := buildVerificationKeyring(ctx, c, calendarID, d.addrKR)
+	if kr, ok := d.verifyKR[calendarID]; ok {
+		covered := true
+		for e := range want {
+			if !d.verifyKRauthors[calendarID][e] {
+				covered = false
+				break
+			}
+		}
+		if covered {
+			return kr, nil
+		}
+	}
+	authors := make([]string, 0, len(d.verifyKRauthors[calendarID])+len(want))
+	for e := range d.verifyKRauthors[calendarID] {
+		authors = append(authors, e)
+	}
+	for e := range want {
+		if !d.verifyKRauthors[calendarID][e] {
+			authors = append(authors, e)
+		}
+	}
+	kr, err := buildVerificationKeyring(ctx, c, calendarID, d.addrKR, authors)
 	if err != nil {
 		return nil, err
 	}
 	d.verifyKR[calendarID] = kr
+	covered := make(map[string]bool, len(authors))
+	for _, e := range authors {
+		covered[e] = true
+	}
+	d.verifyKRauthors[calendarID] = covered
 	return kr, nil
 }
 
@@ -564,7 +603,7 @@ func (d *daemon) handleRequest(ctx context.Context, req daemonRequest) (daemonRe
 		if err != nil {
 			return daemonResponse{Error: fmt.Sprintf("unlock calendar keys: %v", err)}, false
 		}
-		verifyKR, err := d.verificationKeyring(ctx, d.getClient(), req.CalendarID)
+		verifyKR, err := d.verificationKeyring(ctx, d.getClient(), req.CalendarID, collectAuthorEmails([]proton.CalendarEvent{*req.Event}))
 		if err != nil {
 			// Fall back to the bare address keyring: this account's
 			// own events still decrypt.
@@ -696,7 +735,7 @@ func (d *daemon) buildICSFeed(ctx context.Context) (string, error) {
 			fmt.Fprintf(os.Stderr, "daemon: calendar %s: %v (skipped)\n", r.cal.ID, err)
 			continue
 		}
-		verifyKR, err := d.verificationKeyring(ctx, c, r.cal.ID)
+		verifyKR, err := d.verificationKeyring(ctx, c, r.cal.ID, collectAuthorEmails(r.evs))
 		if err != nil {
 			// Fall back to the bare address keyring: the feed still
 			// includes this account's own events.
