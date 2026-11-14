@@ -1135,9 +1135,10 @@ func ensureDaemonForDecrypt() bool {
 	return running
 }
 
-// cmdDaemonStatus reports whether a daemon is running (JSON).
+// cmdDaemonStatus reports whether a daemon is running.
 func cmdDaemonStatus(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("daemon status", flag.ContinueOnError)
+	addJSONFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1146,7 +1147,14 @@ func cmdDaemonStatus(ctx context.Context, args []string) error {
 	if running {
 		out["ics_url"] = fmt.Sprintf("http://127.0.0.1:%d/calendar.ics", icsPort)
 	}
-	return emitJSON(out)
+	return emit(out, func() {
+		if !running {
+			fmt.Fprintln(os.Stdout, "daemon: not running")
+			return
+		}
+		fmt.Fprintln(os.Stdout, "daemon: running")
+		fmt.Fprintf(os.Stdout, "ICS feed: %s\n", out["ics_url"])
+	})
 }
 
 // cmdDaemonICS prints the feed URL and the Apple Calendar subscription

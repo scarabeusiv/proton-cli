@@ -196,7 +196,7 @@ func TestCLIDaemonUnknownSubcommand(t *testing.T) {
 }
 
 func TestCLIDaemonStatusNotRunning(t *testing.T) {
-	out, _, code := runCLI(t, "daemon", "status")
+	out, _, code := runCLI(t, "daemon", "status", "--json")
 	if code != 0 {
 		t.Fatalf("daemon status: exit code %d, want 0", code)
 	}
@@ -240,7 +240,7 @@ func TestCLIDaemonStartBadPort(t *testing.T) {
 }
 
 func TestCLIStatusNoSession(t *testing.T) {
-	stdout, _, code := runCLI(t, "status")
+	stdout, _, code := runCLI(t, "status", "--json")
 	if code != 0 {
 		t.Errorf("status with no session: exit code = %d, want 0", code)
 	}
@@ -564,7 +564,7 @@ func TestIntegrationCalendars(t *testing.T) {
 	newMockAPI(t, m)
 
 	out, err := captureStdout(t, func() error {
-		return cmdCalendars(context.Background(), []string{})
+		return cmdCalendars(context.Background(), []string{"--json"})
 	})
 	if err != nil {
 		t.Fatalf("cmdCalendars: %v", err)
@@ -584,7 +584,7 @@ func TestIntegrationEvents(t *testing.T) {
 
 	out, err := captureStdout(t, func() error {
 		return cmdEvents(context.Background(), []string{
-			"--calendar", "cal1", "--from", "2023-11-14", "--to", "2023-11-15",
+			"--calendar", "cal1", "--from", "2023-11-14", "--to", "2023-11-15", "--json",
 		})
 	})
 	if err != nil {
@@ -624,7 +624,7 @@ func TestIntegrationEventsDecryptEmptyRange(t *testing.T) {
 
 	out, err := captureStdout(t, func() error {
 		return cmdEvents(context.Background(), []string{
-			"--calendar", "cal1", "--from", "2023-11-14", "--to", "2023-11-15", "--decrypt",
+			"--calendar", "cal1", "--from", "2023-11-14", "--to", "2023-11-15", "--decrypt", "--json",
 		})
 	})
 	if err != nil {
@@ -640,7 +640,7 @@ func TestIntegrationStatus(t *testing.T) {
 	newMockAPI(t, m)
 
 	out, err := captureStdout(t, func() error {
-		return cmdStatus(context.Background(), []string{})
+		return cmdStatus(context.Background(), []string{"--json"})
 	})
 	if err != nil {
 		t.Fatalf("cmdStatus: %v", err)
@@ -659,7 +659,7 @@ func TestIntegrationMailList(t *testing.T) {
 	newMockAPI(t, m)
 
 	out, err := captureStdout(t, func() error {
-		return cmdMailList(context.Background(), []string{})
+		return cmdMailList(context.Background(), []string{"--json"})
 	})
 	if err != nil {
 		t.Fatalf("cmdMailList: %v", err)
@@ -678,7 +678,7 @@ func TestIntegrationMailList(t *testing.T) {
 	// Client-side filters: --unread keeps only the unread message,
 	// --subject matches case-insensitively.
 	out, err = captureStdout(t, func() error {
-		return cmdMailList(context.Background(), []string{"--unread"})
+		return cmdMailList(context.Background(), []string{"--unread", "--json"})
 	})
 	if err != nil {
 		t.Fatalf("cmdMailList --unread: %v", err)
@@ -691,7 +691,7 @@ func TestIntegrationMailList(t *testing.T) {
 	}
 
 	out, err = captureStdout(t, func() error {
-		return cmdMailList(context.Background(), []string{"--subject", "WORLD"})
+		return cmdMailList(context.Background(), []string{"--subject", "WORLD", "--json"})
 	})
 	if err != nil {
 		t.Fatalf("cmdMailList --subject: %v", err)
@@ -968,7 +968,7 @@ func TestIntegrationDaemonDecryptNoPrompt(t *testing.T) {
 	// Success proves the daemon served the decrypt.
 	out, err := captureStdout(t, func() error {
 		return cmdEvents(context.Background(), []string{
-			"--calendar", "cal1", "--from", from, "--to", to, "--decrypt",
+			"--calendar", "cal1", "--from", from, "--to", to, "--decrypt", "--json",
 		})
 	})
 	if err != nil {
@@ -1223,7 +1223,7 @@ func TestCLIDaemonStartBackgrounds(t *testing.T) {
 		t.Errorf("daemon log = %q, want a startup line", b)
 	}
 
-	out, _, code := runCLIEnv(t, home, cfg, "", env, "daemon", "status")
+	out, _, code := runCLIEnv(t, home, cfg, "", env, "daemon", "status", "--json")
 	if code != 0 {
 		t.Fatalf("daemon status: exit %d", code)
 	}
@@ -1250,7 +1250,7 @@ func TestCLIDaemonStartBackgrounds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("daemon stop: exit %d", code)
 	}
-	out, _, code = runCLIEnv(t, home, cfg, "", env, "daemon", "status")
+	out, _, code = runCLIEnv(t, home, cfg, "", env, "daemon", "status", "--json")
 	if code != 0 {
 		t.Fatalf("daemon status after stop: exit %d", code)
 	}

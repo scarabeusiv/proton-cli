@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"time"
@@ -88,6 +89,7 @@ Commands:
 
 Secrets are only read from stdin, never from argv or the environment.
 Run 'proton-cli <command> -h' for command flags.
+Output is human-readable text by default; pass --json to a command for JSON output (for scripts).
 `)
 }
 
@@ -105,4 +107,29 @@ func emitJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+// jsonOutput is set by the --json flag on the command being run; the
+// default output is human-readable text. Each command registers the
+// flag on its own FlagSet (bound to this variable), and defining the
+// flag resets it to false, so a command run without --json always
+// prints human-readable output even when a previous command in the
+// same process used --json.
+var jsonOutput bool
+
+// addJSONFlag registers the --json flag on fs. It restores the exact
+// JSON output a command used to print by default, for scripts.
+func addJSONFlag(fs *flag.FlagSet) {
+	fs.BoolVar(&jsonOutput, "json", false, "output JSON instead of human-readable text")
+}
+
+// emit writes v as indented JSON when --json was given; otherwise it
+// calls human to print the human-readable form. The JSON shape is
+// exactly what the command used to print by default.
+func emit(v any, human func()) error {
+	if jsonOutput {
+		return emitJSON(v)
+	}
+	human()
+	return nil
 }

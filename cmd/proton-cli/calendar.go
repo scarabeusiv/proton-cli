@@ -18,6 +18,7 @@ import (
 
 func cmdCalendars(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("calendars", flag.ContinueOnError)
+	addJSONFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -45,7 +46,7 @@ func cmdCalendars(ctx context.Context, args []string) error {
 		})
 	}
 
-	return emitJSON(out)
+	return emit(out, func() { printCalendars(out) })
 }
 
 type eventSummary struct {
@@ -138,6 +139,7 @@ func listCalendarEvents(ctx context.Context, c *proton.Client, calendarID string
 
 func cmdEvents(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	addJSONFlag(fs)
 	calendarID := fs.String("calendar", "", "calendar ID (required)")
 	from := fs.String("from", "", "start date YYYY-MM-DD (default: today)")
 	to := fs.String("to", "", "end date YYYY-MM-DD exclusive (default: from + 1 day)")
@@ -179,7 +181,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 		return fmt.Errorf("list events: %w", err)
 	}
 	if len(first) == 0 {
-		return emitJSON([]eventSummary{})
+		return emit([]eventSummary{}, func() { fmt.Fprintln(os.Stdout, "no events") })
 	}
 
 	// Optional: set up calendar decryption so titles resolve. This runs
@@ -355,7 +357,7 @@ func cmdEvents(ctx context.Context, args []string) error {
 		fmt.Fprintf(os.Stderr, "decrypt: %d/%d events failed to decrypt (first error: %v)\n", decryptFailed, len(events), firstDecryptErr)
 	}
 
-	return emitJSON(out)
+	return emit(out, func() { printEvents(out) })
 }
 
 // decryptEventDetails extracts the SUMMARY, LOCATION and DESCRIPTION
