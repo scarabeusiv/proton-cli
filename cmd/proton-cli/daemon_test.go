@@ -228,7 +228,7 @@ func TestDaemonPingAndStop(t *testing.T) {
 	d := &daemon{addrKR: testKeyRing(t), calKR: make(map[string]*crypto.KeyRing), icsPort: 8765}
 	startTestDaemon(t, d)
 
-	running, port := pingDaemon()
+	running, port, _ := pingDaemon()
 	if !running {
 		t.Fatal("pingDaemon: daemon is not running")
 	}
@@ -246,7 +246,7 @@ func TestDaemonPingAndStop(t *testing.T) {
 	// The daemon shuts down after replying; a later ping must fail.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if running, _ := pingDaemon(); !running {
+		if running, _, _ := pingDaemon(); !running {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -259,7 +259,7 @@ func TestDaemonPingAbsent(t *testing.T) {
 	old := daemonSocketPathOverride
 	daemonSocketPathOverride = filepath.Join(dir, "no-such.sock")
 	t.Cleanup(func() { daemonSocketPathOverride = old })
-	if running, _ := pingDaemon(); running {
+	if running, _, _ := pingDaemon(); running {
 		t.Fatal("pingDaemon reported running with no daemon present")
 	}
 	if _, err := daemonDecryptMailBody("x"); err != errDaemonUnavailable {
@@ -415,10 +415,19 @@ func TestDaemonAccessTokenOpRecoversFromStaleToken(t *testing.T) {
 // TestDaemonBuildICSFeedRecoversFromStaleToken is the same recovery
 // at the feed level: the 503 the daemon served was a feed build
 // failing on a stale refresh token. After a rotation by another
-// process, the feed must still build (empty VCALENDAR here — the
-// mock has no calendars).
+// process, the feed must still build. The mock serves a calendar with
+// a member matching an address, so the feed build reaches the
+// Bearer-checked GetAddresses call, which hits the stale token and
+// forces the retry; the calendar unlock then fails at the passphrase
+// step the mock does not serve, so the calendar is skipped and the
+// feed is empty. The recovery is proven by the refresh the feed build
+// triggered, not by an event in the feed.
 func TestDaemonBuildICSFeedRecoversFromStaleToken(t *testing.T) {
-	_, d := rotatingDaemon(t)
+	m, d := rotatingDaemon(t)
+	m.calendars = testCalendars()
+	m.addresses = []map[string]any{{"ID": "addr1", "Email": "test@example.com"}}
+	m.members = []map[string]any{{"ID": "m1", "Email": "test@example.com"}}
+	enableTestDaemonICS(t, d)
 
 	c2, mgr2, _, err := authedClientDirect(context.Background())
 	if err != nil {
@@ -427,9 +436,22 @@ func TestDaemonBuildICSFeedRecoversFromStaleToken(t *testing.T) {
 	c2.Close()
 	mgr2.Close()
 
+	// Refreshes so far: the eager refresh in rotatingDaemon plus the
+	// rotation just done. The feed build must trigger at least one
+	// more (the stale-token retry).
+	m.mu.Lock()
+	refreshesBefore := m.refreshCalls
+	m.mu.Unlock()
+
 	feed, err := d.buildICSFeedWithRetry(context.Background())
 	if err != nil {
 		t.Fatalf("buildICSFeedWithRetry after rotation: %v", err)
+	}
+	m.mu.Lock()
+	refreshesAfter := m.refreshCalls
+	m.mu.Unlock()
+	if refreshesAfter <= refreshesBefore {
+		t.Errorf("buildICSFeedWithRetry triggered no refresh (before=%d after=%d); the stale-token recovery was not exercised", refreshesBefore, refreshesAfter)
 	}
 	if !strings.HasPrefix(feed, "BEGIN:VCALENDAR\r\n") || !strings.HasSuffix(feed, "END:VCALENDAR\r\n") {
 		t.Errorf("buildICSFeedWithRetry = %q, want an empty VCALENDAR", feed)

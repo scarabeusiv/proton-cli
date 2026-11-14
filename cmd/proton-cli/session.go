@@ -148,7 +148,7 @@ func newClientWithRefreshRetry(ctx context.Context, m *proton.Manager, s session
 // answers, the session file is used directly — that path is safe
 // because no daemon exists to race with.
 func authedClient(ctx context.Context) (*proton.Client, *proton.Manager, error) {
-	if running, _ := pingDaemon(); running {
+	if running, _, _ := pingDaemon(); running {
 		return authedClientViaDaemon(ctx)
 	}
 	c, m, _, err := authedClientDirect(ctx)

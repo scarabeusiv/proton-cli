@@ -48,7 +48,8 @@ the session, because a refreshed token cannot fetch them later.
 - `keys` — diagnostic: key IDs/flags and stored key-salt IDs (no secrets)
 - `event-raw` — diagnostic: one event's part structure (no decrypt)
 - `daemon` — hold the unlocked keyring in memory: `start` | `stop` |
-  `status` | `ics` (see Daemon below)
+  `status` | `ics` (see Daemon below). The ICS feed is opt-in
+  (`daemon start --ics`, or `daemon ics enable` on a running daemon).
 
 ## Daemon
 
@@ -77,22 +78,31 @@ piped stdin, decrypt commands keep prompting per command. `logout`
 stops a running daemon before revoking the session.
 
 ```sh
-proton-cli daemon start [--ics-port 8765] [--ics-days-past 7] [--ics-days-future 90] [--foreground]
+proton-cli daemon start [--ics] [--ics-port 8765] [--ics-days-past 7] [--ics-days-future 90] [--foreground]
 proton-cli daemon stop
-proton-cli daemon status   # JSON: {"running": true, "ics_url": "..."}
-proton-cli daemon ics      # print the feed URL and subscription steps
+proton-cli daemon status   # JSON: {"running": true, "ics_enabled": true, "ics_url": "..."}
+proton-cli daemon ics      # print the feed URL and subscription steps (or "ICS is not enabled")
+proton-cli daemon ics enable   # enable the feed on a running daemon (starts it with ICS if not running)
+proton-cli daemon ics disable  # disable the feed on a running daemon (clears the cache)
 ```
 
 The ICS feed (`http://127.0.0.1:8765/calendar.ics` by default) contains
 the decrypted events for the past 7 days through the next 90 days
 (configurable with the `--ics-days-past` / `--ics-days-future` flags on
-`daemon start`). It is regenerated from Proton on every request, so a
-subscribing calendar sees current data on its next poll; a fetch
-failure serves 503, never a stale feed. The fetch runs detached from
-the HTTP request, so a subscribing calendar that gives up mid-fetch
-cannot cancel it; the feed is still generated fresh and discarded
-afterwards — nothing decrypted is cached. It is served only while the
-daemon is running.
+`daemon start`). It is opt-in and off by default: enable it with
+`daemon start --ics`, or on a running daemon with
+`daemon ics enable` (which starts the daemon with ICS if it is not
+running). When enabled, the daemon keeps the raw calendar events
+exactly as Proton returns them — still encrypted — in memory only
+(never on disk), and refreshes them in the background every 15
+minutes. Each feed request decrypts from that cache, so it returns
+in seconds instead of re-fetching every event from Proton; the feed
+is at most 15 minutes stale. Nothing decrypted is ever cached or
+written to disk. Before adding the calendar, wait for the
+"ICS cache ready" line in the daemon log; until the cache is warm the
+feed serves 503. `daemon ics disable` stops the refresh and clears
+the cache (the daemon itself keeps running). A fetch failure serves
+503, never a stale feed. It is served only while the daemon is running.
 
 Subscribe in Apple Calendar: Calendar > Add Account > Other > Add
 Subscribed Calendar, paste the feed URL. The feed is read-only (the
