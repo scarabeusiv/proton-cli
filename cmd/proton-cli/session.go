@@ -12,6 +12,7 @@ import (
 
 	"github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
+	"golang.org/x/sys/unix"
 )
 
 // session holds the refreshable auth state. The password is never stored.
@@ -216,12 +217,57 @@ func waitForEnter() error {
 	return nil
 }
 
+// termiosEchoOff disables terminal echo on fd and returns the previous
+// terminal state, for termiosRestore. Only the ECHO flag is cleared:
+// canonical mode, signal generation and CR mapping stay as they were,
+// so line editing and Ctrl-C keep working.
+func termiosEchoOff(fd int) (*unix.Termios, error) {
+	old, err := unix.IoctlGetTermios(fd, termiosGetRequest)
+	if err != nil {
+		return nil, err
+	}
+	off := *old
+	off.Lflag &^= unix.ECHO
+	if err := unix.IoctlSetTermios(fd, termiosSetRequest, &off); err != nil {
+		return nil, err
+	}
+	return old, nil
+}
+
+// termiosRestore restores the terminal state saved by termiosEchoOff.
+// The error is ignored: restoration is best-effort cleanup after the
+// read, and there is no recovery if it fails.
+func termiosRestore(fd int, old *unix.Termios) {
+	_ = unix.IoctlSetTermios(fd, termiosSetRequest, old)
+}
+
 // readSecretLine reads one line from stdin (for passwords / TOTP codes) and
 // trims the trailing newline. Callers must zero the returned slice when done.
+//
+// When stdin is a terminal, terminal echo is disabled for the read, so a
+// typed or pasted password is not displayed; a newline is printed
+// afterwards (with echo off the terminal does not advance the line
+// itself). If echo cannot be disabled the read fails rather than
+// reading the secret with echo on. With piped stdin the read is a plain
+// line read, so scripting still works.
 func readSecretLine(prompt string) ([]byte, error) {
 	fmt.Fprintln(os.Stderr, prompt)
 
+	tty := stdinIsTTY()
+	if tty {
+		old, err := termiosEchoOff(int(os.Stdin.Fd()))
+		if err != nil {
+			return nil, fmt.Errorf("disable terminal echo: %w", err)
+		}
+		defer termiosRestore(int(os.Stdin.Fd()), old)
+	}
+
 	line, err := stdinReader.ReadBytes('\n')
+	if tty {
+		// Echo is off, so the terminal does not advance past the
+		// prompt line when the user presses Enter; advance it here.
+		fmt.Fprintln(os.Stderr)
+	}
 	if err != nil {
 		// Accept EOF-terminated input too (e.g. printf without newline).
 		if len(line) == 0 {
