@@ -767,6 +767,7 @@ func (d *daemon) buildICSFeed(ctx context.Context) (string, error) {
 				RRule:        det.RRule,
 				ExDates:      det.ExDates,
 				RecurrenceID: det.RecurrenceID,
+				TZID:         det.TZID,
 			})
 		}
 	}

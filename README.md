@@ -102,7 +102,10 @@ written to disk. Before adding the calendar, wait for the
 "ICS cache ready" line in the daemon log; until the cache is warm the
 feed serves 503. `daemon ics disable` stops the refresh and clears
 the cache (the daemon itself keeps running). A fetch failure serves
-503, never a stale feed. It is served only while the daemon is running.
+503, never a stale feed. It is served only while the daemon is running. Timed events carry
+their timezone, so a recurring event stays at its local time across
+daylight saving changes; the feed includes a VTIMEZONE for each
+timezone it references.
 
 Subscribe in Apple Calendar: Calendar > Add Account > Other > Add
 Subscribed Calendar, paste the feed URL. The feed is read-only (the

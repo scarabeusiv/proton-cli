@@ -294,6 +294,55 @@ func TestDecryptEventDetailsRecurring(t *testing.T) {
 	}
 }
 
+func TestDecryptEventDetailsTZID(t *testing.T) {
+	// A DTSTART with a TZID parameter yields that timezone; a UTC
+	// DTSTART and an all-day DTSTART yield none.
+	ev := &proton.CalendarEvent{
+		ID: "ev1",
+		SharedEvents: []proton.CalendarEventPart{
+			{Type: 0, Data: "BEGIN:VEVENT\nSUMMARY:Videodinner fun\nDTSTART;TZID=Europe/London:20240528T180000\nRRULE:FREQ=WEEKLY;BYDAY=TU\nEND:VEVENT"},
+		},
+	}
+	det, err := decryptEventDetails(ev, nil, nil)
+	if err != nil {
+		t.Fatalf("decryptEventDetails TZID error: %v", err)
+	}
+	if det.TZID != "Europe/London" {
+		t.Errorf("TZID = %q, want Europe/London", det.TZID)
+	}
+	if det.RRule != "FREQ=WEEKLY;BYDAY=TU" {
+		t.Errorf("RRule = %q, want FREQ=WEEKLY;BYDAY=TU", det.RRule)
+	}
+	// A UTC DTSTART (Z suffix) has no TZID.
+	evUTC := &proton.CalendarEvent{
+		ID: "ev2",
+		SharedEvents: []proton.CalendarEventPart{
+			{Type: 0, Data: "BEGIN:VEVENT\nSUMMARY:UTC event\nDTSTART:20240528T170000Z\nEND:VEVENT"},
+		},
+	}
+	detUTC, err := decryptEventDetails(evUTC, nil, nil)
+	if err != nil {
+		t.Fatalf("decryptEventDetails UTC error: %v", err)
+	}
+	if detUTC.TZID != "" {
+		t.Errorf("UTC TZID = %q, want empty", detUTC.TZID)
+	}
+	// An all-day DTSTART (VALUE=DATE) has no TZID.
+	evDay := &proton.CalendarEvent{
+		ID: "ev3",
+		SharedEvents: []proton.CalendarEventPart{
+			{Type: 0, Data: "BEGIN:VEVENT\nSUMMARY:Holiday\nDTSTART;VALUE=DATE:20240528\nEND:VEVENT"},
+		},
+	}
+	detDay, err := decryptEventDetails(evDay, nil, nil)
+	if err != nil {
+		t.Fatalf("decryptEventDetails all-day error: %v", err)
+	}
+	if detDay.TZID != "" {
+		t.Errorf("all-day TZID = %q, want empty", detDay.TZID)
+	}
+}
+
 func TestZero(t *testing.T) {
 	b := []byte{1, 2, 3, 255}
 	zero(b)
