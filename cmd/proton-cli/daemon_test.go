@@ -188,6 +188,260 @@ func TestICSFeedRecurring(t *testing.T) {
 	}
 }
 
+func TestICSFeedTZID(t *testing.T) {
+	// Reproduces the reported bug: a Tuesday event created at 18:00
+	// Europe/London (BST) whose master start is 2024-05-28. 18:00 BST
+	// is 17:00 UTC, so a UTC DTSTART pins the weekly recurrence to
+	// 17:00 UTC year-round and Apple Calendar shows 17:00 in winter
+	// (GMT). The feed must carry the timezone so the recurrence stays
+	// at 18:00 London.
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	ev := icsEvent{
+		ID:      "ev-tz",
+		Start:   time.Date(2024, 5, 28, 17, 0, 0, 0, time.UTC).Unix(),
+		End:     time.Date(2024, 5, 28, 18, 0, 0, 0, time.UTC).Unix(),
+		Summary: "Videodinner fun",
+		RRule:   "FREQ=WEEKLY;BYDAY=TU",
+		TZID:    "Europe/London",
+	}
+	out := icsFeed([]icsEvent{ev}, now)
+	for _, want := range []string{
+		"DTSTART;TZID=Europe/London:20240528T180000\r\n",
+		"DTEND;TZID=Europe/London:20240528T190000\r\n",
+		"RRULE:FREQ=WEEKLY;BYDAY=TU\r\n",
+		"BEGIN:VTIMEZONE\r\n",
+		"TZID:Europe/London\r\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("icsFeed TZID event missing %q in:\n%s", want, out)
+		}
+	}
+	// The old UTC form must not appear: it pins the recurrence to
+	// 17:00 UTC.
+	if strings.Contains(out, "DTSTART:20240528T170000Z") {
+		t.Errorf("icsFeed TZID event must not emit a UTC DTSTART:\n%s", out)
+	}
+}
+
+func TestICSFeedTZIDDST(t *testing.T) {
+	// The weekly 18:00 London event must stay at 18:00 local time in
+	// both summer (BST) and winter (GMT). The UTC instant differs
+	// (17:00 in summer, 18:00 in winter); the local time does not.
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	ev := icsEvent{
+		ID:      "ev-tz",
+		Start:   time.Date(2024, 5, 28, 17, 0, 0, 0, time.UTC).Unix(),
+		End:     time.Date(2024, 5, 28, 18, 0, 0, 0, time.UTC).Unix(),
+		Summary: "Videodinner fun",
+		RRule:   "FREQ=WEEKLY;BYDAY=TU",
+		TZID:    "Europe/London",
+	}
+	out := icsFeed([]icsEvent{ev}, now)
+	// The VTIMEZONE must define DST: daylight +0100 (BST) from the
+	// last Sunday in March, standard +0000 (GMT) from the last Sunday
+	// in October.
+	for _, want := range []string{
+		"BEGIN:DAYLIGHT\r\n",
+		"TZOFFSETTO:+0100\r\n",
+		"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\n",
+		"BEGIN:STANDARD\r\n",
+		"TZOFFSETTO:+0000\r\n",
+		"RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("icsFeed VTIMEZONE missing %q in:\n%s", want, out)
+		}
+	}
+	// Expand the weekly recurrence from the feed's own DTSTART, by
+	// wall-clock weeks in the event's timezone (how a client expands
+	// RRULE): the local time must stay 18:00 in winter as in summer.
+	// The feed's DTSTART must carry the timezone and the local time
+	// (18:00), not a UTC instant. Without the fix it is a UTC
+	// DTSTART (17:00Z) and no DTSTART;TZID line exists.
+	var dtstart string
+	for _, line := range strings.Split(out, "\r\n") {
+		if strings.HasPrefix(line, "DTSTART;TZID=") {
+			dtstart = line
+			break
+		}
+	}
+	if dtstart == "" {
+		t.Fatalf("icsFeed has no DTSTART;TZID line (got a UTC DTSTART instead):\n%s", out)
+	}
+	// dtstart is "DTSTART;TZID=Europe/London:20240528T180000".
+	rest := strings.TrimPrefix(dtstart, "DTSTART;TZID=")
+	colon := strings.Index(rest, ":")
+	if colon < 0 {
+		t.Fatalf("malformed DTSTART line %q", dtstart)
+	}
+	tzid, dtValue := rest[:colon], rest[colon+1:]
+	if tzid != "Europe/London" {
+		t.Fatalf("DTSTART TZID = %q, want Europe/London", tzid)
+	}
+	loc, err := time.LoadLocation(tzid)
+	if err != nil {
+		t.Fatalf("LoadLocation %s: %v", tzid, err)
+	}
+	master, err := time.ParseInLocation("20060102T150405", dtValue, loc)
+	if err != nil {
+		t.Fatalf("parse DTSTART value %q: %v", dtValue, err)
+	}
+	if got := master.Format("15:04"); got != "18:00" {
+		t.Errorf("master local time = %s, want 18:00", got)
+	}
+	if master.UTC().Hour() != 17 {
+		t.Errorf("master UTC hour = %d, want 17 (BST)", master.UTC().Hour())
+	}
+	// 26 weeks later is 2024-11-26, a Tuesday in winter (GMT).
+	winter := time.Date(master.Year(), master.Month(), master.Day()+26*7, master.Hour(), master.Minute(), master.Second(), 0, loc)
+	if winter.Weekday() != time.Tuesday {
+		t.Errorf("winter occurrence weekday = %v, want Tuesday", winter.Weekday())
+	}
+	if got := winter.Format("15:04"); got != "18:00" {
+		t.Errorf("winter occurrence local time = %s, want 18:00", got)
+	}
+	if winter.UTC().Hour() != 18 {
+		t.Errorf("winter occurrence UTC hour = %d, want 18 (GMT)", winter.UTC().Hour())
+	}
+}
+
+func TestICSFeedTZIDExDate(t *testing.T) {
+	// EXDATE and DTSTART must use the same timezone, so an EXDATE
+	// actually matches the occurrence it excludes.
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	ev := icsEvent{
+		ID:      "ev-tz",
+		Start:   time.Date(2024, 5, 28, 17, 0, 0, 0, time.UTC).Unix(),
+		End:     time.Date(2024, 5, 28, 18, 0, 0, 0, time.UTC).Unix(),
+		Summary: "Videodinner fun",
+		RRule:   "FREQ=WEEKLY;BYDAY=TU",
+		ExDates: []string{"EXDATE;TZID=Europe/London:20240604T180000"},
+		TZID:    "Europe/London",
+	}
+	out := icsFeed([]icsEvent{ev}, now)
+	if !strings.Contains(out, "DTSTART;TZID=Europe/London:20240528T180000\r\n") {
+		t.Errorf("icsFeed TZID event missing DTSTART with TZID in:\n%s", out)
+	}
+	if !strings.Contains(out, "EXDATE;TZID=Europe/London:20240604T180000\r\n") {
+		t.Errorf("icsFeed TZID event missing EXDATE with the same TZID in:\n%s", out)
+	}
+	// The EXDATE must name an occurrence of the series: 2024-06-04
+	// is a Tuesday, one week after the master, at the same local time.
+	loc, err := time.LoadLocation("Europe/London")
+	if err != nil {
+		t.Fatalf("LoadLocation Europe/London: %v", err)
+	}
+	ex := time.Date(2024, 6, 4, 18, 0, 0, 0, loc)
+	if ex.Weekday() != time.Tuesday {
+		t.Errorf("EXDATE weekday = %v, want Tuesday", ex.Weekday())
+	}
+	if got := ex.Format("15:04"); got != "18:00" {
+		t.Errorf("EXDATE local time = %s, want 18:00", got)
+	}
+}
+
+func TestICSFeedTZIDRegression(t *testing.T) {
+	// A timed event without a TZID keeps the UTC form, an all-day
+	// event keeps VALUE=DATE, and no VTIMEZONE is emitted when no
+	// event references a timezone.
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	utc := icsEvent{
+		ID:      "ev-utc",
+		Start:   time.Date(2026, 11, 14, 22, 13, 20, 0, time.UTC).Unix(),
+		End:     time.Date(2026, 11, 14, 23, 13, 20, 0, time.UTC).Unix(),
+		Summary: "UTC event",
+	}
+	day := icsEvent{
+		ID:      "ev-day",
+		Start:   time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC).Unix(),
+		End:     time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC).Unix(),
+		FullDay: true,
+		Summary: "Holiday",
+	}
+	out := icsFeed([]icsEvent{utc, day}, now)
+	for _, want := range []string{
+		"DTSTART:20261114T221320Z\r\n",
+		"DTEND:20261114T231320Z\r\n",
+		"DTSTART;VALUE=DATE:20261114\r\n",
+		"DTEND;VALUE=DATE:20261115\r\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("icsFeed regression missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "VTIMEZONE") || strings.Contains(out, "TZID=") {
+		t.Errorf("icsFeed without a TZID must not emit VTIMEZONE or TZID:\n%s", out)
+	}
+	// An un-loadable TZID falls back to UTC rather than breaking the feed.
+	bogus := icsEvent{
+		ID:      "ev-bogus",
+		Start:   time.Date(2026, 11, 14, 22, 13, 20, 0, time.UTC).Unix(),
+		End:     time.Date(2026, 11, 14, 23, 13, 20, 0, time.UTC).Unix(),
+		Summary: "Bogus zone",
+		TZID:    "Bogus/Zone",
+	}
+	out = icsFeed([]icsEvent{bogus}, now)
+	if !strings.Contains(out, "DTSTART:20261114T221320Z\r\n") {
+		t.Errorf("icsFeed un-loadable TZID must fall back to UTC in:\n%s", out)
+	}
+	if strings.Contains(out, "VTIMEZONE") {
+		t.Errorf("icsFeed un-loadable TZID must not emit VTIMEZONE:\n%s", out)
+	}
+}
+
+func TestVTIMEZONELondon(t *testing.T) {
+	vt, err := vtimezone("Europe/London", 2026)
+	if err != nil {
+		t.Fatalf("vtimezone Europe/London: %v", err)
+	}
+	for _, want := range []string{
+		"BEGIN:VTIMEZONE\r\n",
+		"TZID:Europe/London\r\n",
+		"BEGIN:DAYLIGHT\r\n",
+		"TZOFFSETFROM:+0000\r\n",
+		"TZOFFSETTO:+0100\r\n",
+		"TZNAME:BST\r\n",
+		"RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\n",
+		"END:DAYLIGHT\r\n",
+		"BEGIN:STANDARD\r\n",
+		"TZOFFSETFROM:+0100\r\n",
+		"TZOFFSETTO:+0000\r\n",
+		"TZNAME:GMT\r\n",
+		"RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\n",
+		"END:STANDARD\r\n",
+		"END:VTIMEZONE\r\n",
+	} {
+		if !strings.Contains(vt, want) {
+			t.Errorf("vtimezone Europe/London missing %q in:\n%s", want, vt)
+		}
+	}
+}
+
+func TestVTIMEZONEFixedOffset(t *testing.T) {
+	// A zone without DST gets a single STANDARD component.
+	vt, err := vtimezone("Asia/Tokyo", 2026)
+	if err != nil {
+		t.Fatalf("vtimezone Asia/Tokyo: %v", err)
+	}
+	if strings.Contains(vt, "DAYLIGHT") {
+		t.Errorf("vtimezone Asia/Tokyo must not have DAYLIGHT:\n%s", vt)
+	}
+	for _, want := range []string{
+		"TZID:Asia/Tokyo\r\n",
+		"BEGIN:STANDARD\r\n",
+		"TZOFFSETFROM:+0900\r\n",
+		"TZOFFSETTO:+0900\r\n",
+	} {
+		if !strings.Contains(vt, want) {
+			t.Errorf("vtimezone Asia/Tokyo missing %q in:\n%s", want, vt)
+		}
+	}
+	// An unknown timezone is an error, not a broken block.
+	if _, err := vtimezone("Bogus/Zone", 2026); err == nil {
+		t.Errorf("vtimezone Bogus/Zone: expected error, got nil")
+	}
+}
+
 // --- daemon socket protocol ---
 
 // testKeyRing generates a fast (ed25519) PGP keyring for tests.

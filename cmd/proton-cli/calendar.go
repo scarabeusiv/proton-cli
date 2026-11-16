@@ -505,7 +505,9 @@ func buildVerificationKeyring(ctx context.Context, c *proton.Client, calendarID 
 // the raw RRULE value ("" when the event does not recur); ExDates are
 // the full EXDATE lines verbatim (parameters preserved); RecurrenceID
 // is the full RECURRENCE-ID line verbatim ("" unless this event
-// overrides one occurrence of a recurring series).
+// overrides one occurrence of a recurring series). TZID is the IANA
+// timezone of the event's DTSTART as given in the payload ("" when
+// DTSTART has none, e.g. a UTC or all-day event).
 type eventDetails struct {
 	Summary      string
 	Location     string
@@ -513,6 +515,7 @@ type eventDetails struct {
 	RRule        string
 	ExDates      []string
 	RecurrenceID string
+	TZID         string
 }
 
 // decryptEventDetails extracts the SUMMARY, LOCATION and DESCRIPTION
@@ -569,6 +572,9 @@ func decryptEventDetails(ev *proton.CalendarEvent, calKR, addrKR *crypto.KeyRing
 			}
 			if len(out.ExDates) == 0 {
 				out.ExDates = icalPropLines(data, "EXDATE")
+			}
+			if out.TZID == "" {
+				out.TZID = icalDTSTARTZone(data)
 			}
 			if out.Summary != "" && out.Location != "" {
 				return out, nil
@@ -675,6 +681,31 @@ func icalPropLines(ical, prop string) []string {
 		}
 	}
 	return out
+}
+
+// icalDTSTARTZone returns the TZID parameter of the DTSTART property in
+// an iCal VEVENT payload, or "" when DTSTART has none (a UTC value with
+// a Z suffix, or a DATE value). A recurring event keeps its local time
+// across DST only when DTSTART carries its timezone, so the feed emits
+// DTSTART;TZID=... for such events; without a TZID the event is emitted
+// as UTC, as before.
+func icalDTSTARTZone(ical string) string {
+	line := icalPropLine(ical, "DTSTART")
+	if line == "" {
+		return ""
+	}
+	// The parameters sit between the property name and the first ':'.
+	idx := indexOf(line, ':')
+	if idx < 0 {
+		return ""
+	}
+	for _, p := range strings.Split(line[len("DTSTART"):idx], ";") {
+		if v, ok := strings.CutPrefix(p, "TZID="); ok {
+			// A quoted TZID is rare; unquote it.
+			return strings.Trim(v, `"`)
+		}
+	}
+	return ""
 }
 
 func splitLines(s string) []string {
