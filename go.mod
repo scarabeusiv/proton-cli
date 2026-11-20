@@ -6,7 +6,7 @@ require (
 	github.com/ProtonMail/gluon v0.17.0
 	github.com/ProtonMail/go-proton-api v0.0.0-20261102101905-79fbe0626d9b
 	github.com/ProtonMail/gopenpgp/v2 v2.11.1
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 )
 
 require (
